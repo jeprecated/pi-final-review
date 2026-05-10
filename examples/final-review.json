@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "autoReview": false,
+  "docsOnlyReview": "ask",
+  "defaultMode": "background",
+  "reviewers": ["codex", "glm"],
+  "codexModel": "openai-codex/gpt-5.3-codex:high",
+  "glmModel": "zai/glm-5.1:high",
+  "timeoutMs": 600000,
+  "sendFollowUp": false,
+  "skipDuplicateDiff": true
+}
