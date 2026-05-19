@@ -1,7 +1,7 @@
 {
   "name": "pi-final-review",
   "version": "0.1.0",
-  "description": "Pi extension that runs configurable read-only final reviews with SDK sub-agents.",
+  "description": "Pi extension that runs configurable final checks and read-only final reviews with SDK sub-agents.",
   "type": "module",
   "license": "MIT",
   "author": "Jordan Munch O'Hare",
@@ -29,6 +29,7 @@
   },
   "files": [
     "extensions",
+    "docs",
     "README.md",
     "LICENSE"
   ],

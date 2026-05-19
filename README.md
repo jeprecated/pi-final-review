@@ -1,8 +1,8 @@
 # pi-final-review
 
-A [Pi](https://pi.dev/) extension that runs configurable read-only final reviews with SDK sub-agents.
+A [Pi](https://pi.dev/) extension that runs configurable final checks and read-only final reviews with SDK sub-agents.
 
-It can run Codex and/or GLM reviewers against the current working copy or a specific revision, report live progress in Pi, and optionally send the final report back into the chat as a follow-up.
+It can run project commands (type checks, builds, tests) after agent turns, feed failures back to the agent automatically, then run Codex and/or GLM reviewers against the current working copy or a specific revision.
 
 ## Install
 
@@ -39,6 +39,9 @@ Or add it to Pi settings:
 /final-review disable
 /final-review auto on
 /final-review auto off
+/final-review checks
+/final-review checks on
+/final-review checks off
 /final-review send [latest|#id]
 /final-review note <message>
 ```
@@ -57,6 +60,7 @@ Examples:
 /final-review codex rev @-
 /final-review background glm --target abc123 steer
 /final-review force both
+/final-review checks
 /final-review send #1
 ```
 
@@ -81,11 +85,30 @@ Example:
   "glmModel": "zai/glm-5.1:high",
   "timeoutMs": 600000,
   "sendFollowUp": false,
-  "skipDuplicateDiff": true
+  "skipDuplicateDiff": true,
+  "finalChecks": {
+    "enabled": true,
+    "commands": [
+      "npm run typecheck",
+      { "name": "build", "command": "npm run build", "timeoutMs": 600000 }
+    ],
+    "timeoutMs": 600000,
+    "continueOnFailure": false,
+    "sendFollowUp": true
+  }
 }
 ```
 
 `/final-review enable` writes project config with `enabled=true` and `autoReview=true`.
+
+`finalChecks` runs project commands after agent turns. If a command fails, times out, or is cancelled, the extension sends the command, exit status, and captured output back to the agent as a follow-up and defers automatic review until checks pass. Successful check output is kept in the UI report but is not sent to the agent.
+
+Command entries can be strings or objects with:
+
+- `name` — display name
+- `command` — shell command run with `bash -lc` (or `cmd /c` on Windows)
+- `cwd` — optional project-relative working directory
+- `timeoutMs` — optional per-command timeout, capped at 600000 ms
 
 ## Environment variables
 
@@ -95,6 +118,7 @@ Model and timeout overrides:
 PI_FINAL_REVIEW_CODEX_MODEL="openai-codex/gpt-5.3-codex:high" pi
 PI_FINAL_REVIEW_MODEL="zai/glm-5.1:high" pi
 PI_FINAL_REVIEW_TIMEOUT_MS=600000 pi
+PI_FINAL_REVIEW_CHECK_TIMEOUT_MS=600000 pi
 ```
 
 Timeouts are capped at 600000 ms.
@@ -111,7 +135,7 @@ The extension creates read-only SDK sub-agent sessions for review. Reviewer avai
 
 ## Auto-review
 
-When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. Documentation-only changes are controlled by:
+When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
 
 ```json
 {

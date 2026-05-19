@@ -8,5 +8,15 @@
   "glmModel": "zai/glm-5.1:high",
   "timeoutMs": 600000,
   "sendFollowUp": false,
-  "skipDuplicateDiff": true
+  "skipDuplicateDiff": true,
+  "finalChecks": {
+    "enabled": false,
+    "commands": [
+      "npm run typecheck",
+      { "name": "build", "command": "npm run build", "timeoutMs": 600000 }
+    ],
+    "timeoutMs": 600000,
+    "continueOnFailure": false,
+    "sendFollowUp": true
+  }
 }

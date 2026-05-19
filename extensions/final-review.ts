@@ -14,11 +14,26 @@ import {
 import { Box, Text } from "@earendil-works/pi-tui";
 
 type ReviewMode = "background" | "blocking";
-type ReviewCommandAction = "run" | "status" | "cancel" | "config" | "send" | "note" | "enable" | "disable" | "auto-on" | "auto-off";
+type ReviewCommandAction = "run" | "status" | "cancel" | "config" | "send" | "note" | "enable" | "disable" | "auto-on" | "auto-off" | "checks" | "checks-on" | "checks-off";
 type ReviewerName = "codex" | "glm";
 type ReviewOutcome = "success" | "failed" | "timeout" | "skipped" | "cancelled";
 
 type DocsOnlyReviewMode = "ask" | "auto" | "skip";
+
+type FinalCheckCommand = {
+	name: string;
+	command: string;
+	cwd?: string;
+	timeoutMs?: number;
+};
+
+type FinalChecksConfig = {
+	enabled: boolean;
+	commands: FinalCheckCommand[];
+	timeoutMs: number;
+	continueOnFailure: boolean;
+	sendFollowUp: boolean;
+};
 
 type FinalReviewConfig = {
 	enabled: boolean;
@@ -31,10 +46,22 @@ type FinalReviewConfig = {
 	timeoutMs: number;
 	sendFollowUp: boolean;
 	skipDuplicateDiff: boolean;
+	finalChecks: FinalChecksConfig;
 };
 
 type ReviewerResult = {
 	reviewer: ReviewerName;
+	outcome: ReviewOutcome;
+	durationMs: number;
+	output: string;
+	exitCode?: number;
+	error?: string;
+};
+
+type FinalCheckResult = {
+	name: string;
+	command: string;
+	cwd?: string;
 	outcome: ReviewOutcome;
 	durationMs: number;
 	output: string;
@@ -67,13 +94,37 @@ type ReviewReport = {
 	results: ReviewerResult[];
 };
 
+type FinalCheckReport = {
+	id: number;
+	startedAt: number;
+	finishedAt: number;
+	target: string;
+	diffHash: string;
+	commands: FinalCheckCommand[];
+	results: FinalCheckResult[];
+};
+
 type LiveReviewDetails = {
-	kind: "live";
+	kind: "live" | "live-review";
+	jobId: number;
+};
+
+type LiveCheckDetails = {
+	kind: "live-checks";
 	jobId: number;
 };
 
 type ReviewerProgress = {
 	reviewer: ReviewerName;
+	startedAt?: number;
+	finishedAt?: number;
+	outcome?: ReviewOutcome;
+	lastText?: string;
+};
+
+type FinalCheckProgress = {
+	name: string;
+	command: string;
 	startedAt?: number;
 	finishedAt?: number;
 	outcome?: ReviewOutcome;
@@ -93,8 +144,20 @@ type RunningJob = {
 	notes: string[];
 };
 
+type RunningCheckJob = {
+	id: number;
+	startedAt: number;
+	controller: AbortController;
+	promise: Promise<FinalCheckReport>;
+	target: string;
+	diffHash: string;
+	commands: FinalCheckCommand[];
+	progress: FinalCheckProgress[];
+};
+
 const MESSAGE_TYPE = "final-review-report";
 const REVIEWED_DIFF_ENTRY_TYPE = "final-review-reviewed-diff";
+const CHECKED_DIFF_ENTRY_TYPE = "final-review-checked-diff";
 const STATUS_KEY = "final-review";
 const CONFIG_PATH = path.join(".pi", "final-review.json");
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -116,6 +179,13 @@ const DEFAULT_CONFIG: FinalReviewConfig = {
 	timeoutMs: DEFAULT_TIMEOUT_MS,
 	sendFollowUp: false,
 	skipDuplicateDiff: true,
+	finalChecks: {
+		enabled: false,
+		commands: [],
+		timeoutMs: DEFAULT_TIMEOUT_MS,
+		continueOnFailure: false,
+		sendFollowUp: true,
+	},
 };
 
 function uniqReviewers(reviewers: ReviewerName[]): ReviewerName[] {
@@ -136,6 +206,57 @@ function parseTimeoutMs(value: unknown): number | undefined {
 	const numeric = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : undefined;
 	if (numeric === undefined || !Number.isFinite(numeric) || numeric <= 0) return undefined;
 	return Math.min(numeric, MAX_TIMEOUT_MS);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function defaultCheckName(command: string): string {
+	const compact = command.replace(/\s+/g, " ").trim();
+	return compact.length <= 80 ? compact : `${compact.slice(0, 77)}...`;
+}
+
+function parseFinalCheckCommand(value: unknown): FinalCheckCommand | undefined {
+	if (typeof value === "string") {
+		const command = value.trim();
+		return command ? { name: defaultCheckName(command), command } : undefined;
+	}
+	if (!isRecord(value)) return undefined;
+	const command = typeof value.command === "string" ? value.command.trim() : "";
+	if (!command) return undefined;
+	const name = typeof value.name === "string" && value.name.trim() ? value.name.trim() : defaultCheckName(command);
+	const cwd = typeof value.cwd === "string" && value.cwd.trim() ? value.cwd.trim() : undefined;
+	const timeoutMs = parseTimeoutMs(value.timeoutMs);
+	return timeoutMs === undefined ? { name, command, cwd } : { name, command, cwd, timeoutMs };
+}
+
+function parseFinalCheckCommands(value: unknown): FinalCheckCommand[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const commands = value.flatMap((item) => {
+		const command = parseFinalCheckCommand(item);
+		return command ? [command] : [];
+	});
+	return commands.length > 0 ? commands : undefined;
+}
+
+function parseFinalChecksConfig(value: unknown): FinalChecksConfig {
+	const base = DEFAULT_CONFIG.finalChecks;
+	const envTimeoutMs = parseTimeoutMs(process.env.PI_FINAL_REVIEW_CHECK_TIMEOUT_MS);
+	if (typeof value === "boolean") return { ...base, enabled: value, timeoutMs: envTimeoutMs ?? base.timeoutMs };
+	if (Array.isArray(value)) {
+		const commands = parseFinalCheckCommands(value) ?? [];
+		return { ...base, enabled: commands.length > 0, commands, timeoutMs: envTimeoutMs ?? base.timeoutMs };
+	}
+	if (!isRecord(value)) return { ...base, timeoutMs: envTimeoutMs ?? base.timeoutMs };
+
+	const commands = parseFinalCheckCommands(value.commands) ?? base.commands;
+	const hasCommands = Object.prototype.hasOwnProperty.call(value, "commands");
+	const enabled = typeof value.enabled === "boolean" ? value.enabled : hasCommands ? commands.length > 0 : base.enabled;
+	const timeoutMs = parseTimeoutMs(value.timeoutMs) ?? envTimeoutMs ?? base.timeoutMs;
+	const continueOnFailure = typeof value.continueOnFailure === "boolean" ? value.continueOnFailure : base.continueOnFailure;
+	const sendFollowUp = typeof value.sendFollowUp === "boolean" ? value.sendFollowUp : base.sendFollowUp;
+	return { enabled, commands, timeoutMs, continueOnFailure, sendFollowUp };
 }
 
 async function loadLocalConfig(cwd: string): Promise<Record<string, unknown>> {
@@ -173,13 +294,44 @@ async function loadConfig(cwd: string): Promise<FinalReviewConfig> {
 	const timeoutMs = parseTimeoutMs(local.timeoutMs) ?? parseTimeoutMs(process.env.PI_FINAL_REVIEW_TIMEOUT_MS) ?? DEFAULT_CONFIG.timeoutMs;
 	const sendFollowUp = typeof local.sendFollowUp === "boolean" ? local.sendFollowUp : DEFAULT_CONFIG.sendFollowUp;
 	const skipDuplicateDiff = typeof local.skipDuplicateDiff === "boolean" ? local.skipDuplicateDiff : DEFAULT_CONFIG.skipDuplicateDiff;
+	const finalChecks = parseFinalChecksConfig(local.finalChecks);
 
-	return { enabled, autoReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff };
+	return { enabled, autoReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks };
 }
 
 async function execText(pi: ExtensionAPI, command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; text: string }> {
 	const result = await pi.exec(command, args, { cwd, signal, timeout: 30_000 });
 	return { code: result.code, text: [result.stdout, result.stderr].filter(Boolean).join("") };
+}
+
+function shellInvocation(command: string): { command: string; args: string[] } {
+	return process.platform === "win32" ? { command: "cmd", args: ["/d", "/s", "/c", command] } : { command: "bash", args: ["-lc", command] };
+}
+
+function resolveFinalCheckCwd(root: string, check: FinalCheckCommand): { cwd: string; displayCwd?: string } {
+	if (!check.cwd) return { cwd: root };
+	return { cwd: path.resolve(root, check.cwd), displayCwd: check.cwd };
+}
+
+async function runFinalCheckCommand(pi: ExtensionAPI, root: string, check: FinalCheckCommand, defaultTimeoutMs: number, signal?: AbortSignal): Promise<FinalCheckResult> {
+	const startedAt = Date.now();
+	const timeoutMs = check.timeoutMs ?? defaultTimeoutMs;
+	const { cwd, displayCwd } = resolveFinalCheckCwd(root, check);
+	const invocation = shellInvocation(check.command);
+	const base = { name: check.name, command: check.command, cwd: displayCwd, durationMs: 0, output: "" };
+	try {
+		const result = await pi.exec(invocation.command, invocation.args, { cwd, signal, timeout: timeoutMs });
+		const output = shortOutput([result.stdout, result.stderr].filter(Boolean).join(""));
+		const durationMs = Date.now() - startedAt;
+		const outcome: ReviewOutcome = result.code === 0 && !result.killed ? "success" : result.killed && signal?.aborted ? "cancelled" : result.killed ? "timeout" : "failed";
+		const error = outcome === "success" ? undefined : outcome === "timeout" ? `timed out after ${timeoutMs}ms` : outcome === "cancelled" ? "cancelled" : undefined;
+		return { ...base, durationMs, outcome, output, exitCode: result.code, error };
+	} catch (error) {
+		const durationMs = Date.now() - startedAt;
+		const message = errorMessage(error);
+		const outcome: ReviewOutcome = signal?.aborted ? "cancelled" : /timed?\s*out|timeout/i.test(message) ? "timeout" : "failed";
+		return { ...base, durationMs, outcome, output: shortOutput(message), error: message };
+	}
 }
 
 async function getChangedPaths(pi: ExtensionAPI, cwd: string, signal?: AbortSignal): Promise<string[]> {
@@ -378,6 +530,14 @@ async function buildReviewBundle(pi: ExtensionAPI, cwd: string, signal?: AbortSi
 
 function reviewBundleHash(bundle: ReviewBundle): string {
 	return hashText(bundle.fingerprint);
+}
+
+function finalChecksConfigHash(config: FinalChecksConfig): string {
+	return hashText(JSON.stringify(config.commands.map((command) => ({ name: command.name, command: command.command, cwd: command.cwd, timeoutMs: command.timeoutMs ?? config.timeoutMs }))));
+}
+
+function finalCheckRunKey(diffHash: string, config: FinalChecksConfig): string {
+	return `${diffHash}:${finalChecksConfigHash(config)}`;
 }
 
 function hashText(text: string): string {
@@ -703,6 +863,68 @@ function formatReport(report: ReviewReport): string {
 	return lines.join("\n").trimEnd();
 }
 
+function finalCheckResultNeedsAttention(result: FinalCheckResult): boolean {
+	return result.outcome !== "success" && result.outcome !== "skipped";
+}
+
+function finalCheckReportPassed(report: FinalCheckReport): boolean {
+	return report.results.length === report.commands.length && report.results.length > 0 && report.results.every((result) => result.outcome === "success");
+}
+
+function finalCheckReportNeedsAttention(report: FinalCheckReport): boolean {
+	return !finalCheckReportPassed(report) || report.results.some(finalCheckResultNeedsAttention);
+}
+
+function finalCheckDisplayIcon(result: FinalCheckResult): string {
+	return reviewerIcon(result.outcome);
+}
+
+function finalCheckDisplayLabel(result: FinalCheckResult): string {
+	return result.outcome === "success" ? "passed" : result.outcome;
+}
+
+function formatFinalCheckReport(report: FinalCheckReport, options: { includePassingOutput?: boolean } = {}): string {
+	const lines: string[] = [];
+	lines.push(`# Final checks #${report.id}`);
+	lines.push(`Target: ${report.target}`);
+	lines.push(`Diff hash: ${report.diffHash}`);
+	lines.push(`Duration: ${formatDuration(report.finishedAt - report.startedAt)}`);
+	lines.push(`Commands: ${report.commands.length}`);
+	lines.push("");
+	for (const result of report.results) {
+		lines.push(`## ${finalCheckDisplayIcon(result)} ${result.name} — ${finalCheckDisplayLabel(result)} (${formatDuration(result.durationMs)})`);
+		lines.push(`Command: ${result.command}`);
+		lines.push(`Working directory: ${result.cwd ?? "."}`);
+		if (result.exitCode !== undefined) lines.push(`Exit code: ${result.exitCode}`);
+		if (result.error) lines.push(`Error: ${result.error}`);
+		if (result.outcome !== "success" || options.includePassingOutput) {
+			lines.push("");
+			lines.push(result.output || "(no output)");
+		}
+		lines.push("");
+	}
+	for (const command of report.commands.slice(report.results.length)) {
+		lines.push(`## - ${command.name} — not run (0ms)`);
+		lines.push(`Command: ${command.command}`);
+		lines.push(`Working directory: ${command.cwd ?? "."}`);
+		lines.push("");
+	}
+	return lines.join("\n").trimEnd();
+}
+
+function summarizeFinalCheckReport(report: FinalCheckReport): string {
+	const failed = report.results.filter(finalCheckResultNeedsAttention).length;
+	const skipped = report.results.filter((result) => result.outcome === "skipped").length;
+	const notRun = Math.max(0, report.commands.length - report.results.length);
+	if (finalCheckReportPassed(report)) return `Final checks #${report.id}: ✓ ${report.results.length}/${report.commands.length} passed`;
+	const bits = report.results.map((result) => `${finalCheckDisplayIcon(result)} ${result.name} ${finalCheckDisplayLabel(result)} ${formatDuration(result.durationMs)}`);
+	return `Final checks #${report.id}: ${failed} failed${skipped ? `, ${skipped} skipped` : ""}${notRun ? `, ${notRun} not run` : ""}; ${bits.join("; ")}`;
+}
+
+function finalChecksFollowUpMessage(report: FinalCheckReport): string {
+	return `Final checks #${report.id} did not pass. The final-review extension ran the configured project commands after your turn. Continue fixing the project until these checks pass; do not claim the work is done yet. If automatic review is enabled, it is deferred until the checks pass.\n\n${formatFinalCheckReport(report)}`;
+}
+
 function summarizeReport(report: ReviewReport): string {
 	const bits = report.results.map((result) => `${resultDisplayIcon(result)} ${result.reviewer} ${resultDisplayLabel(result)} ${formatDuration(result.durationMs)}`);
 	return `Final review #${report.id}: ${bits.join("; ")}`;
@@ -829,6 +1051,24 @@ function isReviewReport(value: unknown): value is ReviewReport {
 	return typeof report.id === "number" && typeof report.startedAt === "number" && typeof report.finishedAt === "number" && (report.mode === "background" || report.mode === "blocking") && Array.isArray(report.reviewers) && report.reviewers.every((reviewer) => typeof reviewer === "string" && isReviewerName(reviewer)) && typeof report.target === "string" && typeof report.diffHash === "string" && typeof report.bundleBytes === "number" && Array.isArray(report.results) && report.results.every(isReviewerResult);
 }
 
+function isFinalCheckCommand(value: unknown): value is FinalCheckCommand {
+	if (!value || typeof value !== "object") return false;
+	const command = value as Partial<FinalCheckCommand>;
+	return typeof command.name === "string" && typeof command.command === "string" && (command.cwd === undefined || typeof command.cwd === "string") && (command.timeoutMs === undefined || typeof command.timeoutMs === "number");
+}
+
+function isFinalCheckResult(value: unknown): value is FinalCheckResult {
+	if (!value || typeof value !== "object") return false;
+	const result = value as Partial<FinalCheckResult>;
+	return typeof result.name === "string" && typeof result.command === "string" && typeof result.outcome === "string" && ["success", "failed", "timeout", "skipped", "cancelled"].includes(result.outcome) && typeof result.durationMs === "number" && typeof result.output === "string" && (result.cwd === undefined || typeof result.cwd === "string");
+}
+
+function isFinalCheckReport(value: unknown): value is FinalCheckReport {
+	if (!value || typeof value !== "object") return false;
+	const report = value as Partial<FinalCheckReport>;
+	return typeof report.id === "number" && typeof report.startedAt === "number" && typeof report.finishedAt === "number" && typeof report.target === "string" && typeof report.diffHash === "string" && Array.isArray(report.commands) && report.commands.every(isFinalCheckCommand) && Array.isArray(report.results) && report.results.every(isFinalCheckResult);
+}
+
 function reviewReportsFromEntries(entries: unknown[]): ReviewReport[] {
 	return entries.flatMap((entry) => {
 		if (!entry || typeof entry !== "object") return [];
@@ -838,6 +1078,27 @@ function reviewReportsFromEntries(entries: unknown[]): ReviewReport[] {
 		if (message && typeof message === "object") {
 			const customMessage = message as { customType?: unknown; details?: unknown };
 			if (customMessage.customType === MESSAGE_TYPE && isReviewReport(customMessage.details)) return [customMessage.details];
+		}
+		return [];
+	});
+}
+
+function checkedDiffHashesFromEntries(entries: unknown[]): string[] {
+	return entries
+		.filter((entry): entry is { type: string; customType?: string; data?: { hash?: unknown } } => Boolean(entry) && typeof entry === "object" && (entry as { type?: unknown }).type === "custom" && (entry as { customType?: unknown }).customType === CHECKED_DIFF_ENTRY_TYPE)
+		.map((entry) => entry.data?.hash)
+		.filter((hash): hash is string => typeof hash === "string" && hash.length > 0);
+}
+
+function finalCheckReportsFromEntries(entries: unknown[]): FinalCheckReport[] {
+	return entries.flatMap((entry) => {
+		if (!entry || typeof entry !== "object") return [];
+		const topLevel = entry as { customType?: unknown; details?: unknown; message?: unknown };
+		if (topLevel.customType === MESSAGE_TYPE && isFinalCheckReport(topLevel.details)) return [topLevel.details];
+		const message = topLevel.message;
+		if (message && typeof message === "object") {
+			const customMessage = message as { customType?: unknown; details?: unknown };
+			if (customMessage.customType === MESSAGE_TYPE && isFinalCheckReport(customMessage.details)) return [customMessage.details];
 		}
 		return [];
 	});
@@ -905,6 +1166,21 @@ function progressLine(reviewer: ReviewerName, progress: ReviewerProgress): strin
 	return `${icon} ${reviewer}: ${progressLabel(progress)} (${progressDuration(progress)})`;
 }
 
+function finalCheckProgressDuration(progress: FinalCheckProgress): string {
+	if (progress.finishedAt && progress.startedAt) return formatDuration(progress.finishedAt - progress.startedAt);
+	if (progress.startedAt) return formatDuration(Date.now() - progress.startedAt);
+	return "pending";
+}
+
+function finalCheckProgressLabel(progress: FinalCheckProgress): string {
+	return progress.outcome === "success" ? "passed" : progress.outcome ?? (progress.startedAt ? "running" : "pending");
+}
+
+function finalCheckProgressLine(progress: FinalCheckProgress): string {
+	const icon = progress.outcome ? reviewerIcon(progress.outcome) : "◐";
+	return `${icon} ${progress.name}: ${finalCheckProgressLabel(progress)} (${finalCheckProgressDuration(progress)})`;
+}
+
 function formatLiveJobDetails(job: RunningJob): string {
 	const lines = [`Target: ${job.target}`, `Diff hash: ${job.diffHash}`, `Mode: ${job.mode}`, "", "Reviewers:"];
 	for (const reviewer of job.reviewers) {
@@ -932,6 +1208,31 @@ function liveJobWidgetLines(job: RunningJob): string[] {
 	return lines;
 }
 
+function formatLiveCheckJobDetails(job: RunningCheckJob): string {
+	const lines = [`Target: ${job.target}`, `Diff hash: ${job.diffHash}`, "", "Commands:"];
+	for (const progress of job.progress) {
+		lines.push(finalCheckProgressLine(progress));
+		lines.push(`  ${progress.command}`);
+		const snippet = compactLiveSnippet(progress.lastText ?? "");
+		if (snippet) lines.push(indentLines(snippet));
+	}
+	return lines.join("\n");
+}
+
+function liveCheckJobWidgetLines(job: RunningCheckJob): string[] {
+	const lines = [`Final checks #${job.id} · ${truncateChars(job.target, 100)}`];
+	for (const progress of job.progress) {
+		const snippet = compactLiveOneLine(progress.lastText ?? "");
+		lines.push(`${finalCheckProgressLine(progress)}${snippet ? ` — ${snippet}` : ""}`);
+	}
+	return lines;
+}
+
+function summarizeCheckJob(job: RunningCheckJob): string {
+	const bits = job.progress.map((progress) => `${progress.outcome ? reviewerIcon(progress.outcome) : "◐"} ${progress.name} ${finalCheckProgressLabel(progress)} ${finalCheckProgressDuration(progress)}`);
+	return `Final checks #${job.id}: ${bits.join("; ")}`;
+}
+
 function summarizeJob(job: RunningJob): string {
 	const bits = job.reviewers.map((reviewer) => {
 		const progress = job.progress[reviewer];
@@ -944,7 +1245,11 @@ function summarizeJob(job: RunningJob): string {
 }
 
 function isLiveReviewDetails(details: unknown): details is LiveReviewDetails {
-	return Boolean(details) && typeof details === "object" && (details as { kind?: unknown }).kind === "live" && typeof (details as { jobId?: unknown }).jobId === "number";
+	return Boolean(details) && typeof details === "object" && ((details as { kind?: unknown }).kind === "live" || (details as { kind?: unknown }).kind === "live-review") && typeof (details as { jobId?: unknown }).jobId === "number";
+}
+
+function isLiveCheckDetails(details: unknown): details is LiveCheckDetails {
+	return Boolean(details) && typeof details === "object" && (details as { kind?: unknown }).kind === "live-checks" && typeof (details as { jobId?: unknown }).jobId === "number";
 }
 
 type ParsedFinalReviewArgs = {
@@ -979,6 +1284,13 @@ function parseArgs(args: string, config: FinalReviewConfig): ParsedFinalReviewAr
 	if (tokens[0] === "disable-auto" || (tokens[0] === "auto" && ["off", "disable", "disabled", "false"].includes(tokens[1] ?? ""))) return { action: "auto-off", mode: config.defaultMode, reviewers: config.reviewers, steer: false, force: false, extra: "" };
 	if (tokens[0] === "send" || tokens[0] === "follow-up") return { action: "send", mode: config.defaultMode, reviewers: config.reviewers, steer: false, force: false, extra: tokens.slice(1).join(" ") };
 	if (tokens[0] === "note") return { action: "note", mode: config.defaultMode, reviewers: config.reviewers, steer: false, force: false, extra: tokens.slice(1).join(" ") };
+	if (tokens[0] === "checks" || tokens[0] === "check") {
+		const rest = tokens.slice(1);
+		if (["on", "enable", "enabled", "true"].includes(rest[0] ?? "")) return { action: "checks-on", mode: config.defaultMode, reviewers: config.reviewers, steer: false, force: false, extra: rest.slice(1).join(" ") };
+		if (["off", "disable", "disabled", "false"].includes(rest[0] ?? "")) return { action: "checks-off", mode: config.defaultMode, reviewers: config.reviewers, steer: false, force: false, extra: rest.slice(1).join(" ") };
+		const force = rest.includes("force") || rest.includes("again") || rest.includes("--force");
+		return { action: "checks", mode: config.defaultMode, reviewers: config.reviewers, steer: false, force, extra: rest.filter((token) => !["run", "force", "again", "--force"].includes(token)).join(" ") };
+	}
 
 	let mode = config.defaultMode;
 	let reviewers = config.reviewers;
@@ -1012,11 +1324,17 @@ function parseArgs(args: string, config: FinalReviewConfig): ParsedFinalReviewAr
 
 export default function finalReviewExtension(pi: ExtensionAPI) {
 	let currentJob: RunningJob | undefined;
+	let currentCheckJob: RunningCheckJob | undefined;
 	let nextJobId = 1;
+	let nextCheckJobId = 1;
 	const liveJobs = new Map<number, RunningJob>();
+	const liveCheckJobs = new Map<number, RunningCheckJob>();
 	const completedReports = new Map<number, ReviewReport>();
+	const completedCheckReports = new Map<number, FinalCheckReport>();
 	const reviewedDiffs = new Set<string>();
+	const checkedDiffs = new Set<string>();
 	const autoAttemptedDiffs = new Set<string>();
+	const autoCheckAttemptedDiffs = new Set<string>();
 
 	function setStatus(ctx: ExtensionContext) {
 		if (currentJob) {
@@ -1029,6 +1347,10 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				.join(" ");
 			ctx.ui.setStatus(STATUS_KEY, `review #${currentJob.id} ${summary}`);
 			ctx.ui.setWidget(STATUS_KEY, liveJobWidgetLines(currentJob));
+		} else if (currentCheckJob) {
+			const summary = currentCheckJob.progress.map((progress) => `${progress.outcome ? reviewerIcon(progress.outcome) : "◐"}${progress.name}:${finalCheckProgressDuration(progress)}`).join(" ");
+			ctx.ui.setStatus(STATUS_KEY, `checks #${currentCheckJob.id} ${summary}`);
+			ctx.ui.setWidget(STATUS_KEY, liveCheckJobWidgetLines(currentCheckJob));
 		} else {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			ctx.ui.setWidget(STATUS_KEY, undefined);
@@ -1044,9 +1366,35 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		return sendFollowUp;
 	}
 
+	function sendFinalCheckReport(report: FinalCheckReport, checksConfig: FinalChecksConfig): boolean {
+		const needsAttention = finalCheckReportNeedsAttention(report);
+		pi.sendMessage(
+			{
+				customType: MESSAGE_TYPE,
+				content: summarizeFinalCheckReport(report),
+				display: true,
+				details: report,
+			},
+			{ triggerTurn: false },
+		);
+		if (needsAttention && checksConfig.sendFollowUp) {
+			pi.sendUserMessage(finalChecksFollowUpMessage(report), { deliverAs: "followUp" });
+			return true;
+		}
+		return false;
+	}
+
+	function finalChecksConfigured(config: FinalChecksConfig): boolean {
+		return config.enabled && config.commands.length > 0;
+	}
+
 	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false): Promise<ReviewReport | undefined> {
 		if (currentJob) {
 			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
+			return undefined;
+		}
+		if (currentCheckJob) {
+			ctx.ui.notify(`Final checks #${currentCheckJob.id} are already running. Use /final-review status or /final-review cancel.`, "warning");
 			return undefined;
 		}
 
@@ -1168,13 +1516,134 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
+	async function runFinalChecksForBundle(ctx: ExtensionContext, bundle: ReviewBundle, checksConfig: FinalChecksConfig, source: "auto" | "manual"): Promise<FinalCheckReport | undefined> {
+		if (currentJob) {
+			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
+			return undefined;
+		}
+		if (currentCheckJob) {
+			ctx.ui.notify(`Final checks #${currentCheckJob.id} are already running. Use /final-review status or /final-review cancel.`, "warning");
+			return undefined;
+		}
+		if (!checksConfig.enabled) {
+			if (source === "manual") ctx.ui.notify(`Final checks are disabled in ${CONFIG_PATH}. Use /final-review checks on after adding commands.`, "info");
+			return undefined;
+		}
+		if (checksConfig.commands.length === 0) {
+			if (source === "manual") ctx.ui.notify(`No final check commands are configured in ${CONFIG_PATH}.`, "warning");
+			return undefined;
+		}
+
+		const diffHash = reviewBundleHash(bundle);
+		const checkKey = finalCheckRunKey(diffHash, checksConfig);
+		const id = nextCheckJobId++;
+		const controller = new AbortController();
+		const contextSignal = ctx.signal;
+		const abortFromContext = () => controller.abort();
+		if (contextSignal?.aborted) abortFromContext();
+		else contextSignal?.addEventListener("abort", abortFromContext, { once: true });
+		const startedAt = Date.now();
+		const progress: FinalCheckProgress[] = checksConfig.commands.map((command) => ({ name: command.name, command: command.command }));
+		let promise!: Promise<FinalCheckReport>;
+		currentCheckJob = { id, startedAt, controller, promise: undefined as unknown as Promise<FinalCheckReport>, target: bundle.target, diffHash, commands: checksConfig.commands, progress };
+		liveCheckJobs.set(id, currentCheckJob);
+		pi.sendMessage(
+			{
+				customType: MESSAGE_TYPE,
+				content: summarizeCheckJob(currentCheckJob),
+				display: true,
+				details: { kind: "live-checks", jobId: id } satisfies LiveCheckDetails,
+			},
+			{ triggerTurn: false },
+		);
+
+		promise = (async (): Promise<FinalCheckReport> => {
+			const results: FinalCheckResult[] = [];
+			for (let i = 0; i < checksConfig.commands.length; i++) {
+				const command = checksConfig.commands[i]!;
+				const item = progress[i]!;
+				item.startedAt = Date.now();
+				setStatus(ctx);
+				const result = await runFinalCheckCommand(pi, ctx.cwd, command, checksConfig.timeoutMs, controller.signal);
+				item.finishedAt = Date.now();
+				item.outcome = result.outcome;
+				item.lastText = result.output;
+				results.push(result);
+				setStatus(ctx);
+				if (finalCheckResultNeedsAttention(result) && !checksConfig.continueOnFailure) {
+					for (let j = i + 1; j < checksConfig.commands.length; j++) {
+						const skipped = checksConfig.commands[j]!;
+						const skippedProgress = progress[j]!;
+						const skippedAt = Date.now();
+						skippedProgress.startedAt = skippedAt;
+						skippedProgress.finishedAt = skippedAt;
+						skippedProgress.outcome = "skipped";
+						skippedProgress.lastText = "Skipped because a previous final check failed.";
+						results.push({
+							name: skipped.name,
+							command: skipped.command,
+							cwd: skipped.cwd,
+							outcome: "skipped",
+							durationMs: 0,
+							output: "Skipped because a previous final check failed and continueOnFailure=false.",
+						});
+					}
+					setStatus(ctx);
+					break;
+				}
+				if (controller.signal.aborted) break;
+			}
+			return {
+				id,
+				startedAt,
+				finishedAt: Date.now(),
+				target: bundle.target,
+				diffHash,
+				commands: checksConfig.commands,
+				results,
+			};
+		})();
+		currentCheckJob.promise = promise;
+		const ticker = setInterval(() => setStatus(ctx), 1000);
+		ticker.unref();
+		setStatus(ctx);
+		ctx.ui.notify(`Started final checks #${id} (${checksConfig.commands.length} command${checksConfig.commands.length === 1 ? "" : "s"}; target: ${bundle.target}).`, "info");
+
+		let liveJobRemoved = false;
+		const removeLiveJob = () => {
+			if (liveJobRemoved) return;
+			liveCheckJobs.delete(id);
+			liveJobRemoved = true;
+		};
+		try {
+			const report = await promise;
+			if (finalCheckReportPassed(report)) {
+				rememberDiffHash(checkedDiffs, checkKey);
+				pi.appendEntry(CHECKED_DIFF_ENTRY_TYPE, { hash: checkKey, diffHash: report.diffHash, target: report.target, finishedAt: report.finishedAt });
+			}
+			rememberMapEntry(completedCheckReports, report.id, report, MAX_COMPLETED_REPORTS);
+			removeLiveJob();
+			const sentFollowUp = sendFinalCheckReport(report, checksConfig);
+			ctx.ui.notify(summarizeFinalCheckReport(report), finalCheckReportNeedsAttention(report) || sentFollowUp ? "warning" : "info");
+			return report;
+		} finally {
+			clearInterval(ticker);
+			contextSignal?.removeEventListener("abort", abortFromContext);
+			removeLiveJob();
+			if (currentCheckJob?.id === id) currentCheckJob = undefined;
+			setStatus(ctx);
+		}
+	}
+
 	async function maybeAutoReview(ctx: ExtensionContext) {
-		if (currentJob) return;
+		if (currentJob || currentCheckJob) return;
 		const config = await loadConfig(ctx.cwd).catch((error) => {
 			ctx.ui.notify(`Final review auto-run skipped: failed to read ${CONFIG_PATH}: ${friendlyErrorMessage(error)}`, "warning");
 			return undefined;
 		});
-		if (!config?.enabled || !config.autoReview) return;
+		if (!config?.enabled) return;
+		const shouldRunChecks = finalChecksConfigured(config.finalChecks);
+		if (!config.autoReview && !shouldRunChecks) return;
 
 		const changedPaths = await getChangedPaths(pi, ctx.cwd, ctx.signal).catch(() => []);
 		const autoTarget: AutoReviewTarget | undefined = changedPaths.length > 0
@@ -1182,22 +1651,39 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			: await getRecentCommitAutoReviewTarget(pi, ctx.cwd, ctx.signal).catch(() => undefined);
 		if (!autoTarget) return;
 
-		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
-		if (docsOnly && config.docsOnlyReview === "skip") return;
-
 		const bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal, autoTarget.targetRev).catch((error) => {
 			ctx.ui.notify(`Final review auto-run skipped: could not build review target: ${friendlyErrorMessage(error)}`, "warning");
 			return undefined;
 		});
 		if (!bundle) return;
 		const diffHash = reviewBundleHash(bundle);
+		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
+
+		if (shouldRunChecks) {
+			const checkKey = finalCheckRunKey(diffHash, config.finalChecks);
+			if (checkedDiffs.has(checkKey)) {
+				// Checks already passed for this exact diff and command set.
+			} else if (autoCheckAttemptedDiffs.has(checkKey)) return;
+			else {
+				rememberDiffHash(autoCheckAttemptedDiffs, checkKey);
+				const checkReport = await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "auto").catch((error) => {
+					ctx.ui.notify(`Final checks auto-run failed: ${friendlyErrorMessage(error)}`, "warning");
+					return undefined;
+				});
+				if (!checkReport || !finalCheckReportPassed(checkReport)) return;
+			}
+		}
+
+		if (!config.autoReview) return;
+		if (docsOnly && config.docsOnlyReview === "skip") return;
 		if (reviewedDiffs.has(diffHash) || autoAttemptedDiffs.has(diffHash)) return;
 
 		if (docsOnly && config.docsOnlyReview === "ask") {
 			if (!ctx.hasUI) return;
 			const preview = autoTarget.changedPaths.slice(0, 8).join("\n");
 			const suffix = autoTarget.changedPaths.length > 8 ? `\n... +${autoTarget.changedPaths.length - 8} more` : "";
-			const ok = await ctx.ui.confirm("Review documentation-only changes?", `${autoTarget.description}:\n\n${preview}${suffix}\n\nRun final review now?`);
+			const prompt = shouldRunChecks ? "Final checks passed. Run final review now?" : "Run final review now?";
+			const ok = await ctx.ui.confirm("Review documentation-only changes?", `${autoTarget.description}:\n\n${preview}${suffix}\n\n${prompt}`);
 			rememberDiffHash(autoAttemptedDiffs, diffHash);
 			if (!ok) return;
 		} else {
@@ -1212,9 +1698,14 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const entries = ctx.sessionManager.getEntries();
 		for (const hash of reviewedDiffHashesFromEntries(entries)) rememberDiffHash(reviewedDiffs, hash);
+		for (const hash of checkedDiffHashesFromEntries(entries)) rememberDiffHash(checkedDiffs, hash);
 		for (const report of reviewReportsFromEntries(entries)) {
 			rememberMapEntry(completedReports, report.id, report, MAX_COMPLETED_REPORTS);
 			nextJobId = Math.max(nextJobId, report.id + 1);
+		}
+		for (const report of finalCheckReportsFromEntries(entries)) {
+			rememberMapEntry(completedCheckReports, report.id, report, MAX_COMPLETED_REPORTS);
+			nextCheckJobId = Math.max(nextCheckJobId, report.id + 1);
 		}
 		setStatus(ctx);
 	});
@@ -1233,28 +1724,37 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		}
 		const parsed = parseArgs(args, config);
 		if (parsed.action === "status") {
-			if (!currentJob) {
-				ctx.ui.notify("No final review is running.", "info");
-				setStatus(ctx);
+			if (currentJob) {
+				ctx.ui.notify(`Final review #${currentJob.id} running for ${formatDuration(Date.now() - currentJob.startedAt)} (${currentJob.mode}; ${currentJob.reviewers.join(", ")}; target ${currentJob.target}; diff ${currentJob.diffHash}).`, "info");
 				return;
 			}
-			ctx.ui.notify(`Final review #${currentJob.id} running for ${formatDuration(Date.now() - currentJob.startedAt)} (${currentJob.mode}; ${currentJob.reviewers.join(", ")}; target ${currentJob.target}; diff ${currentJob.diffHash}).`, "info");
+			if (currentCheckJob) {
+				ctx.ui.notify(`Final checks #${currentCheckJob.id} running for ${formatDuration(Date.now() - currentCheckJob.startedAt)} (${currentCheckJob.commands.length} command${currentCheckJob.commands.length === 1 ? "" : "s"}; target ${currentCheckJob.target}; diff ${currentCheckJob.diffHash}).`, "info");
+				return;
+			}
+			ctx.ui.notify("No final review or final checks are running.", "info");
+			setStatus(ctx);
 			return;
 		}
 		if (parsed.action === "cancel") {
-			if (!currentJob) {
-				ctx.ui.notify("No final review is running.", "info");
+			if (currentJob) {
+				currentJob.controller.abort();
+				ctx.ui.notify(`Cancelling final review #${currentJob.id}.`, "warning");
 				return;
 			}
-			currentJob.controller.abort();
-			ctx.ui.notify(`Cancelling final review #${currentJob.id}.`, "warning");
+			if (currentCheckJob) {
+				currentCheckJob.controller.abort();
+				ctx.ui.notify(`Cancelling final checks #${currentCheckJob.id}.`, "warning");
+				return;
+			}
+			ctx.ui.notify("No final review or final checks are running.", "info");
 			return;
 		}
 		if (parsed.action === "config") {
 			ctx.ui.notify(
 				`Final review config (${CONFIG_PATH} optional):\n` +
 					JSON.stringify(config, null, 2) +
-					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeout: timeoutMs and PI_FINAL_REVIEW_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only changes. sendFollowUp only forwards actionable review results; /final-review send forwards any completed report on demand.`,
+					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
 				"info",
 			);
 			return;
@@ -1269,6 +1769,34 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			} catch (error) {
 				ctx.ui.notify(`Failed to update ${CONFIG_PATH}: ${friendlyErrorMessage(error)}`, "error");
 			}
+			return;
+		}
+		if (parsed.action === "checks-on" || parsed.action === "checks-off") {
+			try {
+				const local = await loadLocalConfig(ctx.cwd);
+				const existing = isRecord(local.finalChecks) ? local.finalChecks : Array.isArray(local.finalChecks) ? { commands: local.finalChecks } : {};
+				const enabled = parsed.action === "checks-on";
+				const next = await writeLocalConfigPatch(ctx.cwd, { finalChecks: { ...existing, enabled } });
+				const nextChecks = isRecord(next.finalChecks) ? next.finalChecks : {};
+				ctx.ui.notify(`${enabled ? "Enabled" : "Disabled"} final checks for this project in ${CONFIG_PATH}.\n${JSON.stringify({ finalChecks: nextChecks }, null, 2)}`, "info");
+			} catch (error) {
+				ctx.ui.notify(`Failed to update ${CONFIG_PATH}: ${friendlyErrorMessage(error)}`, "error");
+			}
+			return;
+		}
+		if (parsed.action === "checks") {
+			if (!config.enabled) {
+				ctx.ui.notify(`Final review is disabled by ${CONFIG_PATH}.`, "info");
+				return;
+			}
+			const bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal).catch((error) => {
+				ctx.ui.notify(`Final checks could not build review target: ${friendlyErrorMessage(error)}`, "error");
+				return undefined;
+			});
+			if (!bundle) return;
+			await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "manual").catch((error) => {
+				ctx.ui.notify(`Final checks failed: ${friendlyErrorMessage(error)}`, "error");
+			});
 			return;
 		}
 		if (parsed.action === "send") {
@@ -1310,7 +1838,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("final-review", {
-		description: "Run read-only SDK sub-agent final review. Usage: /final-review enable|auto on|auto off|[background|blocking] [both|codex|glm] [rev <rev>] [steer] [force]; /final-review send [latest|#id]|status|cancel|note <text>|config",
+		description: "Run final checks and read-only SDK sub-agent final review. Usage: /final-review enable|auto on|auto off|checks [on|off]|[background|blocking] [both|codex|glm] [rev <rev>] [steer] [force]; /final-review send [latest|#id]|status|cancel|note <text>|config",
 		handler: handleCommand,
 	});
 
@@ -1321,14 +1849,15 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 	pi.registerMessageRenderer(MESSAGE_TYPE, (message, { expanded }, theme) => {
 		const details = message.details;
-		let report = details as ReviewReport | undefined;
-		let content = typeof message.content === "string" ? message.content : Array.isArray(message.content) ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n") : "Final review";
+		const report = isReviewReport(details) ? details : undefined;
+		const checkReport = isFinalCheckReport(details) ? details : undefined;
+		const content = typeof message.content === "string" ? message.content : Array.isArray(message.content) ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n") : "Final review";
 		if (isLiveReviewDetails(details)) {
 			const liveJob = liveJobs.get(details.jobId);
 			const completed = completedReports.get(details.jobId);
 			if (liveJob) {
-				content = summarizeJob(liveJob);
-				let text = `${theme.fg("accent", "◐")} ${theme.bold("Final Review")} ${theme.fg("dim", "·")} ${content}`;
+				const liveContent = summarizeJob(liveJob);
+				let text = `${theme.fg("accent", "◐")} ${theme.bold("Final Review")} ${theme.fg("dim", "·")} ${liveContent}`;
 				if (expanded) text += `\n${theme.fg("dim", formatLiveJobDetails(liveJob))}`;
 				else text += ` ${theme.fg("dim", "(expand for live progress)")}`;
 				const box = new Box(1, 1, (value) => theme.bg("customMessageBg", value));
@@ -1345,8 +1874,40 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				return box;
 			}
 		}
+		if (isLiveCheckDetails(details)) {
+			const liveJob = liveCheckJobs.get(details.jobId);
+			const completed = completedCheckReports.get(details.jobId);
+			if (liveJob) {
+				const liveContent = summarizeCheckJob(liveJob);
+				let text = `${theme.fg("accent", "◐")} ${theme.bold("Final Checks")} ${theme.fg("dim", "·")} ${liveContent}`;
+				if (expanded) text += `\n${theme.fg("dim", formatLiveCheckJobDetails(liveJob))}`;
+				else text += ` ${theme.fg("dim", "(expand for live progress)")}`;
+				const box = new Box(1, 1, (value) => theme.bg("customMessageBg", value));
+				box.addChild(new Text(text, 0, 0));
+				return box;
+			}
+			if (completed) {
+				const attention = finalCheckReportNeedsAttention(completed);
+				const color = attention ? "warning" : "success";
+				let text = `${theme.fg(color, attention ? "!" : "✓")} ${theme.bold("Final Checks")} ${theme.fg("dim", "·")} ${summarizeFinalCheckReport(completed)} ${theme.fg("dim", "(final report posted separately)")}`;
+				if (expanded) text += `\n${theme.fg("dim", `Target: ${completed.target}`)}`;
+				const box = new Box(1, 1, (value) => theme.bg("customMessageBg", value));
+				box.addChild(new Text(text, 0, 0));
+				return box;
+			}
+		}
+		if (checkReport) {
+			const attention = finalCheckReportNeedsAttention(checkReport);
+			const color = attention ? "warning" : "success";
+			let text = `${theme.fg(color, attention ? "!" : "✓")} ${theme.bold("Final Checks")} ${theme.fg("dim", "·")} ${content}`;
+			if (expanded) text += `\n${theme.fg("dim", formatFinalCheckReport(checkReport, { includePassingOutput: true }))}`;
+			else text += ` ${theme.fg("dim", attention ? "(expand for failing output)" : "(expand for command summary)")}`;
+			const box = new Box(1, 1, (value) => theme.bg("customMessageBg", value));
+			box.addChild(new Text(text, 0, 0));
+			return box;
+		}
 		let text = `${theme.fg("accent", "◐")} ${theme.bold("Final Review")} ${theme.fg("dim", "·")} ${content}`;
-		if (report && !isLiveReviewDetails(report)) {
+		if (report) {
 			const attention = reportNeedsAttention(report);
 			const color = attention ? "warning" : "success";
 			text = `${theme.fg(color, attention ? "!" : "✓")} ${theme.bold("Final Review")} ${theme.fg("dim", "·")} ${content}`;
@@ -1368,6 +1929,7 @@ export const __test__ = {
 	finalReportSendCommand,
 	finalReportSendHint,
 	formatDuration,
+	formatFinalCheckReport,
 	formatReport,
 	getChangedPaths,
 	getRecentCommitAutoReviewTarget,
@@ -1377,6 +1939,7 @@ export const __test__ = {
 	parseChangedPaths,
 	parseReportReference,
 	parseTimestampMs,
+	isLiveCheckDetails,
 	isLiveReviewDetails,
 	loadConfig,
 	loadLocalConfig,
@@ -1384,11 +1947,20 @@ export const __test__ = {
 	MAX_TIMEOUT_MS,
 	RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS,
 	parseGitStatusPaths,
+	parseFinalCheckCommands,
+	parseFinalChecksConfig,
 	parseReviewerList,
 	parseReviewerVerdict,
 	parseReviewModelSpec,
 	parseTimeoutMs,
 	reviewBundleHash,
+	checkedDiffHashesFromEntries,
+	finalCheckReportNeedsAttention,
+	finalCheckReportPassed,
+	finalCheckReportsFromEntries,
+	finalCheckRunKey,
+	finalChecksConfigHash,
+	finalChecksFollowUpMessage,
 	reviewedDiffHashesFromEntries,
 	rememberDiffHash,
 	rememberMapEntry,
@@ -1404,6 +1976,7 @@ export const __test__ = {
 	reviewReportsFromEntries,
 	shouldSendFollowUp,
 	shouldAutoReviewSteer,
+	summarizeFinalCheckReport,
 	completedReportForReference,
 	latestCompletedReport,
 	writeLocalConfigPatch,
