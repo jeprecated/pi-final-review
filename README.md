@@ -154,6 +154,7 @@ Valid values:
 ```sh
 npm install
 npm run typecheck
+npm test
 pi -e ./
 ```
 
