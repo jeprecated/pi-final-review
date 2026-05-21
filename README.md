@@ -9,7 +9,7 @@ It can run project commands (type checks, builds, tests) after agent turns, feed
 From git:
 
 ```sh
-pi install git:github.com:ohare93/pi-final-review
+pi install git:github.com:jeprecated/pi-final-review
 ```
 
 For local development:

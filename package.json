@@ -7,12 +7,12 @@
   "author": "Jordan Munch O'Hare",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/ohare93/pi-final-review.git"
+    "url": "git+ssh://git@github.com/jeprecated/pi-final-review.git"
   },
   "bugs": {
-    "url": "https://github.com/ohare93/pi-final-review/issues"
+    "url": "https://github.com/jeprecated/pi-final-review/issues"
   },
-  "homepage": "https://github.com/ohare93/pi-final-review#readme",
+  "homepage": "https://github.com/jeprecated/pi-final-review#readme",
   "keywords": [
     "pi-package",
     "pi",
