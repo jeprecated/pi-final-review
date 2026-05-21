@@ -23,6 +23,18 @@ const config: Parameters<typeof finalReview.parseArgs>[1] = {
 		timeoutMs: 600_000,
 		continueOnFailure: false,
 		sendFollowUp: true,
+		childProjects: {
+			enabled: false,
+			run: "all",
+			projects: [],
+			defaults: {},
+			discover: {
+				enabled: false,
+				configPath: ".pi/final-review.json",
+				maxDepth: 3,
+				exclude: [".git", ".jj", ".hg", "node_modules", ".direnv", ".devbox"],
+			},
+		},
 	},
 };
 
@@ -183,6 +195,76 @@ test("local timeout config takes precedence over environment timeout", async () 
 		} finally {
 			restoreTimeoutEnv(originalEnv);
 		}
+	});
+});
+
+test("child project final checks resolve with wrappers and child cwd", async () => {
+	await withTempDir(async (cwd) => {
+		await mkdir(join(cwd, ".pi"), { recursive: true });
+		await mkdir(join(cwd, "repo", ".pi"), { recursive: true });
+		await writeFile(join(cwd, ".pi", "final-review.json"), JSON.stringify({
+			finalChecks: {
+				childProjects: {
+					projects: ["repo"],
+					defaults: { commandWrapper: "devbox run -- bash -lc {command:q}" },
+				},
+			},
+		}), "utf8");
+		await writeFile(join(cwd, "repo", ".pi", "final-review.json"), JSON.stringify({
+			finalChecks: {
+				enabled: true,
+				timeoutMs: 1234,
+				commands: [{ name: "typecheck", command: "npm run typecheck", cwd: "app" }],
+			},
+		}), "utf8");
+
+		const loaded = await finalReview.loadConfig(cwd);
+		assert.equal(loaded.finalChecks.enabled, true);
+		assert.equal(loaded.finalChecks.childProjects.enabled, true);
+		const commands = await finalReview.resolveFinalCheckCommands(cwd, loaded.finalChecks, "manual");
+		assert.deepEqual(commands, [{
+			name: "repo: typecheck",
+			command: "devbox run -- bash -lc 'npm run typecheck'",
+			cwd: "repo/app",
+			timeoutMs: 1234,
+		}]);
+	});
+});
+
+test("child project final checks can filter to changed children", async () => {
+	await withTempDir(async (cwd) => {
+		for (const repo of ["repo-a", "repo-b"]) {
+			await mkdir(join(cwd, repo, ".pi"), { recursive: true });
+			await writeFile(join(cwd, repo, ".pi", "final-review.json"), JSON.stringify({ finalChecks: { enabled: true, commands: ["npm run typecheck"] } }), "utf8");
+		}
+		const checks = finalReview.parseFinalChecksConfig({
+			enabled: true,
+			childProjects: {
+				run: "changed",
+				projects: ["repo-a", "repo-b"],
+			},
+		});
+		const commands = await finalReview.resolveFinalCheckCommands(cwd, checks, "auto", ["repo-b/src/index.ts"]);
+		assert.deepEqual(commands.map((command) => command.name), ["repo-b: npm run typecheck"]);
+	});
+});
+
+test("child project final checks can discover nested final-review configs", async () => {
+	await withTempDir(async (cwd) => {
+		await mkdir(join(cwd, "apps", "mobile", ".pi"), { recursive: true });
+		await mkdir(join(cwd, "node_modules", "ignored", ".pi"), { recursive: true });
+		await writeFile(join(cwd, "apps", "mobile", ".pi", "final-review.json"), JSON.stringify({ finalChecks: { enabled: true, commands: ["npm run build"] } }), "utf8");
+		await writeFile(join(cwd, "node_modules", "ignored", ".pi", "final-review.json"), JSON.stringify({ finalChecks: { enabled: true, commands: ["npm run ignored"] } }), "utf8");
+		const checks = finalReview.parseFinalChecksConfig({
+			enabled: true,
+			childProjects: {
+				discover: { maxDepth: 3 },
+			},
+		});
+		const projects = await finalReview.discoverChildProjects(cwd, checks.childProjects.discover);
+		assert.deepEqual(projects.map((project) => project.path), ["apps/mobile"]);
+		const commands = await finalReview.resolveFinalCheckCommands(cwd, checks, "manual");
+		assert.deepEqual(commands.map((command) => command.name), ["apps/mobile: npm run build"]);
 	});
 });
 

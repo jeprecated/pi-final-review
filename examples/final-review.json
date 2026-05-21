@@ -17,6 +17,21 @@
     ],
     "timeoutMs": 600000,
     "continueOnFailure": false,
-    "sendFollowUp": true
+    "sendFollowUp": true,
+    "childProjects": {
+      "enabled": false,
+      "run": "all",
+      "projects": [
+        { "path": "agent-tick" }
+      ],
+      "defaults": {
+        "commandWrapper": "devbox run -- bash -lc {command:q}"
+      },
+      "discover": {
+        "enabled": false,
+        "configPath": ".pi/final-review.json",
+        "maxDepth": 3
+      }
+    }
   }
 }

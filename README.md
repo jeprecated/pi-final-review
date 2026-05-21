@@ -94,7 +94,18 @@ Example:
     ],
     "timeoutMs": 600000,
     "continueOnFailure": false,
-    "sendFollowUp": true
+    "sendFollowUp": true,
+    "childProjects": {
+      "enabled": false,
+      "run": "all",
+      "defaults": {
+        "commandWrapper": "devbox run -- bash -lc {command:q}"
+      },
+      "projects": [
+        { "path": "apps/mobile" },
+        { "path": "services/api", "commandWrapper": "devbox run -- bash -lc {command:q}" }
+      ]
+    }
   }
 }
 ```
@@ -109,6 +120,41 @@ Command entries can be strings or objects with:
 - `command` — shell command run with `bash -lc` (or `cmd /c` on Windows)
 - `cwd` — optional project-relative working directory
 - `timeoutMs` — optional per-command timeout, capped at 600000 ms
+
+### Child project checks
+
+Meta workspaces can run checks from nested repos by adding `finalChecks.childProjects`. Each child keeps its own `.pi/final-review.json`; the meta workspace reads the child's `finalChecks.commands`, runs them from that child path, and reports failures in one combined final-check report.
+
+```json
+{
+  "finalChecks": {
+    "enabled": true,
+    "childProjects": {
+      "enabled": true,
+      "run": "all",
+      "defaults": {
+        "commandWrapper": "devbox run -- bash -lc {command:q}"
+      },
+      "projects": [
+        { "path": "agent-tick" }
+      ],
+      "discover": {
+        "enabled": false,
+        "configPath": ".pi/final-review.json",
+        "maxDepth": 3
+      }
+    }
+  }
+}
+```
+
+`run` controls automatic checks:
+
+- `all` — run every configured/discovered child project.
+- `changed` — run only child projects touched by the current diff.
+- `manual` — only run child project checks via `/final-review checks`.
+
+`commandWrapper` is applied only to child commands. Use `{command}` for raw substitution or `{command:q}` for shell-quoted substitution. If no placeholder is present, the original command is appended, so `"devbox run --"` becomes `devbox run -- npm run typecheck`.
 
 ## Environment variables
 

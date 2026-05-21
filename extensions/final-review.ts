@@ -27,12 +27,44 @@ type FinalCheckCommand = {
 	timeoutMs?: number;
 };
 
+type ChildProjectRunMode = "all" | "changed" | "manual";
+
+type FinalCheckChildProject = {
+	path: string;
+	name?: string;
+	enabled: boolean;
+	configPath?: string;
+	commandWrapper?: string;
+	timeoutMs?: number;
+};
+
+type FinalCheckChildProjectDefaults = {
+	commandWrapper?: string;
+	timeoutMs?: number;
+};
+
+type FinalCheckChildProjectDiscover = {
+	enabled: boolean;
+	configPath: string;
+	maxDepth: number;
+	exclude: string[];
+};
+
+type FinalCheckChildProjectsConfig = {
+	enabled: boolean;
+	run: ChildProjectRunMode;
+	projects: FinalCheckChildProject[];
+	defaults: FinalCheckChildProjectDefaults;
+	discover: FinalCheckChildProjectDiscover;
+};
+
 type FinalChecksConfig = {
 	enabled: boolean;
 	commands: FinalCheckCommand[];
 	timeoutMs: number;
 	continueOnFailure: boolean;
 	sendFollowUp: boolean;
+	childProjects: FinalCheckChildProjectsConfig;
 };
 
 type FinalReviewConfig = {
@@ -185,6 +217,18 @@ const DEFAULT_CONFIG: FinalReviewConfig = {
 		timeoutMs: DEFAULT_TIMEOUT_MS,
 		continueOnFailure: false,
 		sendFollowUp: true,
+		childProjects: {
+			enabled: false,
+			run: "all",
+			projects: [],
+			defaults: {},
+			discover: {
+				enabled: false,
+				configPath: CONFIG_PATH,
+				maxDepth: 3,
+				exclude: [".git", ".jj", ".hg", "node_modules", ".direnv", ".devbox"],
+			},
+		},
 	},
 };
 
@@ -240,31 +284,98 @@ function parseFinalCheckCommands(value: unknown): FinalCheckCommand[] | undefine
 	return commands.length > 0 ? commands : undefined;
 }
 
+function parseChildProjectRunMode(value: unknown): ChildProjectRunMode | undefined {
+	return value === "all" || value === "changed" || value === "manual" ? value : undefined;
+}
+
+function parseChildProject(value: unknown): FinalCheckChildProject | undefined {
+	if (typeof value === "string") {
+		const projectPath = value.trim();
+		return projectPath ? { path: projectPath, enabled: true } : undefined;
+	}
+	if (!isRecord(value)) return undefined;
+	const projectPath = typeof value.path === "string" ? value.path.trim() : "";
+	if (!projectPath) return undefined;
+	const name = typeof value.name === "string" && value.name.trim() ? value.name.trim() : undefined;
+	const configPath = typeof value.configPath === "string" && value.configPath.trim() ? value.configPath.trim() : undefined;
+	const commandWrapper = typeof value.commandWrapper === "string" && value.commandWrapper.trim() ? value.commandWrapper.trim() : undefined;
+	const timeoutMs = parseTimeoutMs(value.timeoutMs);
+	const enabled = typeof value.enabled === "boolean" ? value.enabled : true;
+	return { path: projectPath, name, enabled, configPath, commandWrapper, timeoutMs };
+}
+
+function parseChildProjects(value: unknown): FinalCheckChildProject[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const projects = value.flatMap((item) => {
+		const project = parseChildProject(item);
+		return project ? [project] : [];
+	});
+	return projects.length > 0 ? projects : undefined;
+}
+
+function parseChildProjectDefaults(value: unknown): FinalCheckChildProjectDefaults {
+	if (!isRecord(value)) return {};
+	const commandWrapper = typeof value.commandWrapper === "string" && value.commandWrapper.trim() ? value.commandWrapper.trim() : undefined;
+	const timeoutMs = parseTimeoutMs(value.timeoutMs);
+	return { commandWrapper, timeoutMs };
+}
+
+function parseChildProjectDiscover(value: unknown): FinalCheckChildProjectDiscover {
+	const base = DEFAULT_CONFIG.finalChecks.childProjects.discover;
+	if (typeof value === "boolean") return { ...base, enabled: value };
+	if (!isRecord(value)) return { ...base };
+	const enabled = typeof value.enabled === "boolean" ? value.enabled : true;
+	const configPath = typeof value.configPath === "string" && value.configPath.trim() ? value.configPath.trim() : base.configPath;
+	const maxDepth = typeof value.maxDepth === "number" && Number.isFinite(value.maxDepth) && value.maxDepth > 0 ? Math.min(Math.floor(value.maxDepth), 16) : base.maxDepth;
+	const exclude = Array.isArray(value.exclude) ? value.exclude.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim()) : base.exclude;
+	return { enabled, configPath, maxDepth, exclude };
+}
+
+function parseFinalCheckChildProjectsConfig(value: unknown): FinalCheckChildProjectsConfig {
+	const base = DEFAULT_CONFIG.finalChecks.childProjects;
+	if (typeof value === "boolean") return { ...base, enabled: value, defaults: { ...base.defaults }, discover: { ...base.discover } };
+	if (Array.isArray(value)) {
+		const projects = parseChildProjects(value) ?? [];
+		return { ...base, enabled: projects.length > 0, projects, defaults: { ...base.defaults }, discover: { ...base.discover } };
+	}
+	if (!isRecord(value)) return { ...base, defaults: { ...base.defaults }, discover: { ...base.discover } };
+
+	const projects = parseChildProjects(value.projects) ?? base.projects;
+	const defaults = parseChildProjectDefaults(value.defaults);
+	const discover = parseChildProjectDiscover(value.discover);
+	const run = parseChildProjectRunMode(value.run) ?? base.run;
+	const hasConfiguredProjects = projects.length > 0 || discover.enabled;
+	const enabled = typeof value.enabled === "boolean" ? value.enabled : hasConfiguredProjects;
+	return { enabled, run, projects, defaults, discover };
+}
+
 function parseFinalChecksConfig(value: unknown): FinalChecksConfig {
 	const base = DEFAULT_CONFIG.finalChecks;
 	const envTimeoutMs = parseTimeoutMs(process.env.PI_FINAL_REVIEW_CHECK_TIMEOUT_MS);
-	if (typeof value === "boolean") return { ...base, enabled: value, timeoutMs: envTimeoutMs ?? base.timeoutMs };
+	if (typeof value === "boolean") return { ...base, enabled: value, timeoutMs: envTimeoutMs ?? base.timeoutMs, childProjects: { ...base.childProjects, defaults: { ...base.childProjects.defaults }, discover: { ...base.childProjects.discover } } };
 	if (Array.isArray(value)) {
 		const commands = parseFinalCheckCommands(value) ?? [];
-		return { ...base, enabled: commands.length > 0, commands, timeoutMs: envTimeoutMs ?? base.timeoutMs };
+		return { ...base, enabled: commands.length > 0, commands, timeoutMs: envTimeoutMs ?? base.timeoutMs, childProjects: { ...base.childProjects, defaults: { ...base.childProjects.defaults }, discover: { ...base.childProjects.discover } } };
 	}
-	if (!isRecord(value)) return { ...base, timeoutMs: envTimeoutMs ?? base.timeoutMs };
+	if (!isRecord(value)) return { ...base, timeoutMs: envTimeoutMs ?? base.timeoutMs, childProjects: { ...base.childProjects, defaults: { ...base.childProjects.defaults }, discover: { ...base.childProjects.discover } } };
 
 	const commands = parseFinalCheckCommands(value.commands) ?? base.commands;
+	const childProjects = parseFinalCheckChildProjectsConfig(value.childProjects);
 	const hasCommands = Object.prototype.hasOwnProperty.call(value, "commands");
-	const enabled = typeof value.enabled === "boolean" ? value.enabled : hasCommands ? commands.length > 0 : base.enabled;
+	const hasChildProjects = Object.prototype.hasOwnProperty.call(value, "childProjects");
+	const enabled = typeof value.enabled === "boolean" ? value.enabled : (hasCommands && commands.length > 0) || (hasChildProjects && childProjects.enabled) ? true : base.enabled;
 	const timeoutMs = parseTimeoutMs(value.timeoutMs) ?? envTimeoutMs ?? base.timeoutMs;
 	const continueOnFailure = typeof value.continueOnFailure === "boolean" ? value.continueOnFailure : base.continueOnFailure;
 	const sendFollowUp = typeof value.sendFollowUp === "boolean" ? value.sendFollowUp : base.sendFollowUp;
-	return { enabled, commands, timeoutMs, continueOnFailure, sendFollowUp };
+	return { enabled, commands, timeoutMs, continueOnFailure, sendFollowUp, childProjects };
 }
 
-async function loadLocalConfig(cwd: string): Promise<Record<string, unknown>> {
-	const configPath = path.resolve(cwd, CONFIG_PATH);
+async function loadLocalConfig(cwd: string, configPath = CONFIG_PATH): Promise<Record<string, unknown>> {
+	const resolvedConfigPath = path.resolve(cwd, configPath);
 	try {
-		const raw = await fs.readFile(configPath, "utf8");
+		const raw = await fs.readFile(resolvedConfigPath, "utf8");
 		const parsed = JSON.parse(raw) as unknown;
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${CONFIG_PATH} must contain a JSON object`);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${configPath} must contain a JSON object`);
 		return parsed as Record<string, unknown>;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -281,8 +392,8 @@ async function writeLocalConfigPatch(cwd: string, patch: Record<string, unknown>
 	return next;
 }
 
-async function loadConfig(cwd: string): Promise<FinalReviewConfig> {
-	const local = await loadLocalConfig(cwd);
+async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalReviewConfig> {
+	const local = await loadLocalConfig(cwd, configPath);
 
 	const enabled = typeof local.enabled === "boolean" ? local.enabled : DEFAULT_CONFIG.enabled;
 	const autoReview = typeof local.autoReview === "boolean" ? local.autoReview : DEFAULT_CONFIG.autoReview;
@@ -311,6 +422,154 @@ function shellInvocation(command: string): { command: string; args: string[] } {
 function resolveFinalCheckCwd(root: string, check: FinalCheckCommand): { cwd: string; displayCwd?: string } {
 	if (!check.cwd) return { cwd: root };
 	return { cwd: path.resolve(root, check.cwd), displayCwd: check.cwd };
+}
+
+function normalizePathForConfig(filePath: string): string {
+	return filePath.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function expandHome(filePath: string): string {
+	if (filePath === "~") return process.env.HOME ?? filePath;
+	if (filePath.startsWith("~/")) return path.join(process.env.HOME ?? "~", filePath.slice(2));
+	return filePath;
+}
+
+function resolveProjectPath(root: string, projectPath: string): string {
+	const expanded = expandHome(projectPath);
+	return path.resolve(root, expanded);
+}
+
+function childProjectDisplayPath(root: string, projectPath: string): string {
+	const absolute = resolveProjectPath(root, projectPath);
+	const relative = path.relative(root, absolute);
+	if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return normalizePathForConfig(projectPath);
+	return normalizePathForConfig(relative);
+}
+
+function joinConfigPaths(...parts: Array<string | undefined>): string | undefined {
+	const present = parts.filter((part): part is string => Boolean(part && part.trim()));
+	if (present.length === 0) return undefined;
+	return normalizePathForConfig(path.join(...present));
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function applyCommandWrapper(wrapper: string | undefined, command: string, context: { projectRoot?: string; cwd?: string } = {}): string {
+	if (!wrapper?.trim()) return command;
+	let wrapped = wrapper.trim();
+	const hadCommandPlaceholder = /\{command(?::q)?\}/.test(wrapped);
+	const replacements: Record<string, string | undefined> = {
+		command,
+		project: context.projectRoot,
+		cwd: context.cwd,
+	};
+	for (const [key, value] of Object.entries(replacements)) {
+		if (value === undefined) continue;
+		wrapped = wrapped.replaceAll(`{${key}:q}`, shellQuote(value));
+		wrapped = wrapped.replaceAll(`{${key}}`, value);
+	}
+	return hadCommandPlaceholder ? wrapped : `${wrapped} ${command}`;
+}
+
+function changedPathsAffectProject(root: string, projectPath: string, changedPaths: string[]): boolean {
+	if (changedPaths.length === 0) return false;
+	const displayPath = childProjectDisplayPath(root, projectPath);
+	if (!displayPath || displayPath.startsWith("..")) return false;
+	return changedPaths.some((changedPath) => {
+		const normalized = normalizePathForConfig(changedPath);
+		return normalized === displayPath || normalized.startsWith(`${displayPath}/`);
+	});
+}
+
+function shouldRunChildProject(source: "auto" | "manual", runMode: ChildProjectRunMode, root: string, projectPath: string, changedPaths: string[]): boolean {
+	if (source === "manual") return true;
+	if (runMode === "manual") return false;
+	if (runMode === "changed") return changedPathsAffectProject(root, projectPath, changedPaths);
+	return true;
+}
+
+function shouldExcludeDiscoveryPath(relativePath: string, exclude: string[]): boolean {
+	const normalized = normalizePathForConfig(relativePath);
+	const segments = normalized.split("/").filter(Boolean);
+	return exclude.some((entry) => {
+		const normalizedEntry = normalizePathForConfig(entry);
+		return segments.includes(normalizedEntry) || normalized === normalizedEntry || normalized.startsWith(`${normalizedEntry}/`);
+	});
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+	try {
+		await fs.access(filePath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function discoverChildProjects(root: string, discover: FinalCheckChildProjectDiscover): Promise<FinalCheckChildProject[]> {
+	if (!discover.enabled) return [];
+	const projects: FinalCheckChildProject[] = [];
+	const queue: Array<{ relativePath: string; depth: number }> = [{ relativePath: "", depth: 0 }];
+	while (queue.length > 0) {
+		const current = queue.shift()!;
+		let entries: Array<{ isDirectory(): boolean; name: string }>;
+		try {
+			entries = await fs.readdir(path.resolve(root, current.relativePath), { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const childRelative = normalizePathForConfig(path.join(current.relativePath, entry.name));
+			const childDepth = current.depth + 1;
+			if (childDepth > discover.maxDepth || shouldExcludeDiscoveryPath(childRelative, discover.exclude)) continue;
+			const configFile = path.resolve(root, childRelative, discover.configPath);
+			if (await pathExists(configFile)) {
+				projects.push({ path: childRelative, enabled: true, configPath: discover.configPath });
+				continue;
+			}
+			queue.push({ relativePath: childRelative, depth: childDepth });
+		}
+	}
+	return projects;
+}
+
+async function resolveFinalCheckCommands(root: string, checksConfig: FinalChecksConfig, source: "auto" | "manual", changedPaths: string[] = []): Promise<FinalCheckCommand[]> {
+	const commands: FinalCheckCommand[] = [...checksConfig.commands];
+	const childProjectsConfig = checksConfig.childProjects;
+	if (!childProjectsConfig.enabled) return commands;
+
+	const explicitProjects = childProjectsConfig.projects;
+	const discoveredProjects = await discoverChildProjects(root, childProjectsConfig.discover);
+	const projects = new Map<string, FinalCheckChildProject>();
+	for (const project of explicitProjects) projects.set(childProjectDisplayPath(root, project.path), project);
+	for (const project of discoveredProjects) {
+		const key = childProjectDisplayPath(root, project.path);
+		if (!projects.has(key)) projects.set(key, project);
+	}
+
+	for (const project of projects.values()) {
+		if (!project.enabled) continue;
+		if (!shouldRunChildProject(source, childProjectsConfig.run, root, project.path, changedPaths)) continue;
+		const childRoot = resolveProjectPath(root, project.path);
+		const displayPath = childProjectDisplayPath(root, project.path);
+		const childConfig = await loadConfig(childRoot, project.configPath ?? childProjectsConfig.discover.configPath);
+		if (!childConfig.enabled || !childConfig.finalChecks.enabled) continue;
+		for (const childCommand of childConfig.finalChecks.commands) {
+			const commandCwd = path.resolve(childRoot, childCommand.cwd ?? ".");
+			const wrapper = project.commandWrapper ?? childProjectsConfig.defaults.commandWrapper;
+			const command = applyCommandWrapper(wrapper, childCommand.command, { projectRoot: childRoot, cwd: commandCwd });
+			commands.push({
+				name: `${project.name ?? displayPath}: ${childCommand.name}`,
+				command,
+				cwd: joinConfigPaths(displayPath, childCommand.cwd),
+				timeoutMs: childCommand.timeoutMs ?? project.timeoutMs ?? childProjectsConfig.defaults.timeoutMs ?? childConfig.finalChecks.timeoutMs,
+			});
+		}
+	}
+	return commands;
 }
 
 async function runFinalCheckCommand(pi: ExtensionAPI, root: string, check: FinalCheckCommand, defaultTimeoutMs: number, signal?: AbortSignal): Promise<FinalCheckResult> {
@@ -532,12 +791,12 @@ function reviewBundleHash(bundle: ReviewBundle): string {
 	return hashText(bundle.fingerprint);
 }
 
-function finalChecksConfigHash(config: FinalChecksConfig): string {
-	return hashText(JSON.stringify(config.commands.map((command) => ({ name: command.name, command: command.command, cwd: command.cwd, timeoutMs: command.timeoutMs ?? config.timeoutMs }))));
+function finalChecksCommandsHash(commands: FinalCheckCommand[], defaultTimeoutMs = DEFAULT_TIMEOUT_MS): string {
+	return hashText(JSON.stringify(commands.map((command) => ({ name: command.name, command: command.command, cwd: command.cwd, timeoutMs: command.timeoutMs ?? defaultTimeoutMs }))));
 }
 
-function finalCheckRunKey(diffHash: string, config: FinalChecksConfig): string {
-	return `${diffHash}:${finalChecksConfigHash(config)}`;
+function finalCheckRunKey(diffHash: string, commands: FinalCheckCommand[], defaultTimeoutMs = DEFAULT_TIMEOUT_MS): string {
+	return `${diffHash}:${finalChecksCommandsHash(commands, defaultTimeoutMs)}`;
 }
 
 function hashText(text: string): string {
@@ -1385,7 +1644,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	}
 
 	function finalChecksConfigured(config: FinalChecksConfig): boolean {
-		return config.enabled && config.commands.length > 0;
+		return config.enabled && (config.commands.length > 0 || config.childProjects.enabled);
 	}
 
 	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false): Promise<ReviewReport | undefined> {
@@ -1516,7 +1775,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	async function runFinalChecksForBundle(ctx: ExtensionContext, bundle: ReviewBundle, checksConfig: FinalChecksConfig, source: "auto" | "manual"): Promise<FinalCheckReport | undefined> {
+	async function runFinalChecksForBundle(ctx: ExtensionContext, bundle: ReviewBundle, checksConfig: FinalChecksConfig, source: "auto" | "manual", options: { changedPaths?: string[]; commands?: FinalCheckCommand[] } = {}): Promise<FinalCheckReport | undefined> {
 		if (currentJob) {
 			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
 			return undefined;
@@ -1529,13 +1788,14 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			if (source === "manual") ctx.ui.notify(`Final checks are disabled in ${CONFIG_PATH}. Use /final-review checks on after adding commands.`, "info");
 			return undefined;
 		}
-		if (checksConfig.commands.length === 0) {
+		const commands = options.commands ?? await resolveFinalCheckCommands(ctx.cwd, checksConfig, source, options.changedPaths ?? []);
+		if (commands.length === 0) {
 			if (source === "manual") ctx.ui.notify(`No final check commands are configured in ${CONFIG_PATH}.`, "warning");
 			return undefined;
 		}
 
 		const diffHash = reviewBundleHash(bundle);
-		const checkKey = finalCheckRunKey(diffHash, checksConfig);
+		const checkKey = finalCheckRunKey(diffHash, commands, checksConfig.timeoutMs);
 		const id = nextCheckJobId++;
 		const controller = new AbortController();
 		const contextSignal = ctx.signal;
@@ -1543,9 +1803,9 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		if (contextSignal?.aborted) abortFromContext();
 		else contextSignal?.addEventListener("abort", abortFromContext, { once: true });
 		const startedAt = Date.now();
-		const progress: FinalCheckProgress[] = checksConfig.commands.map((command) => ({ name: command.name, command: command.command }));
+		const progress: FinalCheckProgress[] = commands.map((command) => ({ name: command.name, command: command.command }));
 		let promise!: Promise<FinalCheckReport>;
-		currentCheckJob = { id, startedAt, controller, promise: undefined as unknown as Promise<FinalCheckReport>, target: bundle.target, diffHash, commands: checksConfig.commands, progress };
+		currentCheckJob = { id, startedAt, controller, promise: undefined as unknown as Promise<FinalCheckReport>, target: bundle.target, diffHash, commands, progress };
 		liveCheckJobs.set(id, currentCheckJob);
 		pi.sendMessage(
 			{
@@ -1559,8 +1819,8 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 		promise = (async (): Promise<FinalCheckReport> => {
 			const results: FinalCheckResult[] = [];
-			for (let i = 0; i < checksConfig.commands.length; i++) {
-				const command = checksConfig.commands[i]!;
+			for (let i = 0; i < commands.length; i++) {
+				const command = commands[i]!;
 				const item = progress[i]!;
 				item.startedAt = Date.now();
 				setStatus(ctx);
@@ -1571,8 +1831,8 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				results.push(result);
 				setStatus(ctx);
 				if (finalCheckResultNeedsAttention(result) && !checksConfig.continueOnFailure) {
-					for (let j = i + 1; j < checksConfig.commands.length; j++) {
-						const skipped = checksConfig.commands[j]!;
+					for (let j = i + 1; j < commands.length; j++) {
+						const skipped = commands[j]!;
 						const skippedProgress = progress[j]!;
 						const skippedAt = Date.now();
 						skippedProgress.startedAt = skippedAt;
@@ -1599,7 +1859,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				finishedAt: Date.now(),
 				target: bundle.target,
 				diffHash,
-				commands: checksConfig.commands,
+				commands,
 				results,
 			};
 		})();
@@ -1607,7 +1867,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		const ticker = setInterval(() => setStatus(ctx), 1000);
 		ticker.unref();
 		setStatus(ctx);
-		ctx.ui.notify(`Started final checks #${id} (${checksConfig.commands.length} command${checksConfig.commands.length === 1 ? "" : "s"}; target: ${bundle.target}).`, "info");
+		ctx.ui.notify(`Started final checks #${id} (${commands.length} command${commands.length === 1 ? "" : "s"}; target: ${bundle.target}).`, "info");
 
 		let liveJobRemoved = false;
 		const removeLiveJob = () => {
@@ -1658,19 +1918,29 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		if (!bundle) return;
 		const diffHash = reviewBundleHash(bundle);
 		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
+		let finalChecksPassedForDiff = false;
 
 		if (shouldRunChecks) {
-			const checkKey = finalCheckRunKey(diffHash, config.finalChecks);
-			if (checkedDiffs.has(checkKey)) {
-				// Checks already passed for this exact diff and command set.
-			} else if (autoCheckAttemptedDiffs.has(checkKey)) return;
-			else {
-				rememberDiffHash(autoCheckAttemptedDiffs, checkKey);
-				const checkReport = await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "auto").catch((error) => {
-					ctx.ui.notify(`Final checks auto-run failed: ${friendlyErrorMessage(error)}`, "warning");
-					return undefined;
-				});
-				if (!checkReport || !finalCheckReportPassed(checkReport)) return;
+			const commands = await resolveFinalCheckCommands(ctx.cwd, config.finalChecks, "auto", autoTarget.changedPaths).catch((error) => {
+				ctx.ui.notify(`Final checks auto-run skipped: failed to resolve child project checks: ${friendlyErrorMessage(error)}`, "warning");
+				return undefined;
+			});
+			if (!commands) return;
+			if (commands.length > 0) {
+				const checkKey = finalCheckRunKey(diffHash, commands, config.finalChecks.timeoutMs);
+				if (checkedDiffs.has(checkKey)) {
+					// Checks already passed for this exact diff and command set.
+					finalChecksPassedForDiff = true;
+				} else if (autoCheckAttemptedDiffs.has(checkKey)) return;
+				else {
+					rememberDiffHash(autoCheckAttemptedDiffs, checkKey);
+					const checkReport = await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "auto", { changedPaths: autoTarget.changedPaths, commands }).catch((error) => {
+						ctx.ui.notify(`Final checks auto-run failed: ${friendlyErrorMessage(error)}`, "warning");
+						return undefined;
+					});
+					if (!checkReport || !finalCheckReportPassed(checkReport)) return;
+					finalChecksPassedForDiff = true;
+				}
 			}
 		}
 
@@ -1682,7 +1952,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) return;
 			const preview = autoTarget.changedPaths.slice(0, 8).join("\n");
 			const suffix = autoTarget.changedPaths.length > 8 ? `\n... +${autoTarget.changedPaths.length - 8} more` : "";
-			const prompt = shouldRunChecks ? "Final checks passed. Run final review now?" : "Run final review now?";
+			const prompt = finalChecksPassedForDiff ? "Final checks passed. Run final review now?" : "Run final review now?";
 			const ok = await ctx.ui.confirm("Review documentation-only changes?", `${autoTarget.description}:\n\n${preview}${suffix}\n\n${prompt}`);
 			rememberDiffHash(autoAttemptedDiffs, diffHash);
 			if (!ok) return;
@@ -1754,7 +2024,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Final review config (${CONFIG_PATH} optional):\n` +
 					JSON.stringify(config, null, 2) +
-					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
+					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
 				"info",
 			);
 			return;
@@ -1947,6 +2217,9 @@ export const __test__ = {
 	MAX_TIMEOUT_MS,
 	RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS,
 	parseGitStatusPaths,
+	applyCommandWrapper,
+	discoverChildProjects,
+	parseFinalCheckChildProjectsConfig,
 	parseFinalCheckCommands,
 	parseFinalChecksConfig,
 	parseReviewerList,
@@ -1959,8 +2232,9 @@ export const __test__ = {
 	finalCheckReportPassed,
 	finalCheckReportsFromEntries,
 	finalCheckRunKey,
-	finalChecksConfigHash,
+	finalChecksCommandsHash,
 	finalChecksFollowUpMessage,
+	resolveFinalCheckCommands,
 	reviewedDiffHashesFromEntries,
 	rememberDiffHash,
 	rememberMapEntry,
