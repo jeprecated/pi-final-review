@@ -194,7 +194,58 @@ When `autoReview` or `finalChecks` automation is enabled, the extension snapshot
 
 This prevents a fresh session from running checks just because the repo was already dirty, while still letting you opt in from the prompt. Set `requireTurnChanges=false` to restore the old always-run behavior.
 
-`commitReminder.enabled=true` adds a final jj reminder step only after configured checks have passed (and after clean automatic review, when review is enabled). If checks fail, the agent gets the failing check output instead. If checks pass and jj changes remain, the agent gets the commit reminder. If checks pass and there is nothing to commit, nothing is sent. The reminder is gated to turns that changed the target.
+`commitReminder.enabled=true` adds a commit reminder step only after configured checks have passed (and after clean automatic review, when review is enabled). If checks fail, the agent gets the failing check output instead. If checks pass and VCS changes remain, the agent gets a commit reminder. If checks pass and there is nothing to commit, nothing is sent. The reminder is gated to turns that changed the target.
+
+Commit reminders prefer jj when a jj repo is detected (`.jj` / `jj root`), and fall back to git when only git is detected (`.git` / `git rev-parse --show-toplevel`). The follow-up uses the matching commands (`jj status --no-pager` / `jj diff --summary --no-pager` / `jj commit`, or `git status --short` / `git diff --stat` / `git add -A && git commit`).
+
+Automatic finalization flow:
+
+```text
+agent_start
+  |
+  v
+snapshot review-target hash
+  |
+  v
+agent_end
+  |
+  v
+same target as snapshot?
+  |-- yes --> unchangedTurnReview
+  |             |-- ask --> user chooses yes/no
+  |             |-- skip --> stop
+  |             '-- run --> continue
+  |
+  v
+resolve finalChecks commands (root + child projects)
+  |
+  v
+commands configured?
+  |-- no --> continue
+  |
+  v
+run checks
+  |-- fail/timeout/cancel --> send failing check output to agent; stop
+  '-- pass ------------.
+                       |
+                       v
+autoReview enabled?
+  |-- yes --> run review
+  |           |-- findings/failure --> send review output to agent; stop
+  |           '-- clean ------------.
+  |                                |
+  '-- no --------------------------'
+                       |
+                       v
+commitReminder enabled and this turn changed the target?
+  |-- no --> stop
+  |
+  v
+VCS dirty?
+  |-- jj dirty  --> send jj commit reminder
+  |-- git dirty --> send git commit reminder
+  '-- clean ----> stop
+```
 
 When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
 

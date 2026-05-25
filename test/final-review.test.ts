@@ -276,6 +276,36 @@ test("child project final checks can discover nested final-review configs", asyn
 	});
 });
 
+test("commit reminder prompts support jj and git", () => {
+	assert.match(finalReview.commitReminderPrompt("jj"), /jj status --no-pager/);
+	assert.match(finalReview.commitReminderPrompt("jj"), /jj commit -m/);
+	assert.match(finalReview.commitReminderPrompt("git"), /git status --short/);
+	assert.match(finalReview.commitReminderPrompt("git"), /git add -A && git commit -m/);
+});
+
+test("commit reminder VCS detection prefers jj and falls back to git", async () => {
+	const jjPi = {
+		exec: async (command: string, args: string[]) => {
+			const key = [command, ...args].join(" ");
+			if (key === "jj root") return { code: 0, stdout: "/repo\n", stderr: "" };
+			if (key === "jj diff --summary --no-pager") return { code: 0, stdout: "M src/index.ts\n", stderr: "" };
+			throw new Error(`unexpected command: ${key}`);
+		},
+	} as unknown as Parameters<typeof finalReview.commitReminderVcsState>[0];
+	assert.deepEqual(await finalReview.commitReminderVcsState(jjPi, "/repo"), { kind: "jj", root: "/repo", hasChanges: true, summary: "M src/index.ts" });
+
+	const gitPi = {
+		exec: async (command: string, args: string[]) => {
+			const key = [command, ...args].join(" ");
+			if (key === "jj root") return { code: 1, stdout: "", stderr: "not jj" };
+			if (key === "git rev-parse --show-toplevel") return { code: 0, stdout: "/repo\n", stderr: "" };
+			if (key === "git status --short") return { code: 0, stdout: " M src/index.ts\n?? new.ts\n", stderr: "" };
+			throw new Error(`unexpected command: ${key}`);
+		},
+	} as unknown as Parameters<typeof finalReview.commitReminderVcsState>[0];
+	assert.deepEqual(await finalReview.commitReminderVcsState(gitPi, "/repo"), { kind: "git", root: "/repo", hasChanges: true, summary: "M src/index.ts\n?? new.ts" });
+});
+
 test("auto-review mode auto-steers actionable findings even when manual follow-up is off", () => {
 	assert.equal(finalReview.shouldAutoReviewSteer({ autoReview: true }), true);
 	assert.equal(finalReview.shouldAutoReviewSteer({ autoReview: false }), false);

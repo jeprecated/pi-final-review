@@ -63,6 +63,15 @@ type CommitReminderConfig = {
 	enabled: boolean;
 };
 
+type CommitReminderVcsKind = "jj" | "git";
+
+type CommitReminderVcsState = {
+	kind: CommitReminderVcsKind;
+	root: string;
+	hasChanges: boolean;
+	summary: string;
+};
+
 type FinalChecksConfig = {
 	enabled: boolean;
 	commands: FinalCheckCommand[];
@@ -205,9 +214,6 @@ const MESSAGE_TYPE = "final-review-report";
 const REVIEWED_DIFF_ENTRY_TYPE = "final-review-reviewed-diff";
 const CHECKED_DIFF_ENTRY_TYPE = "final-review-checked-diff";
 const STATUS_KEY = "final-review";
-const JJ_COMMIT_REMINDER_PROMPT = `final-review reminder: this agent turn left uncommitted jj working-copy changes.
-
-Before you finish, inspect \`jj status --no-pager\` and \`jj diff --summary --no-pager\`. If the changes are complete and in scope for this task, run relevant validation and commit them with \`jj commit -m "<conventional commit message>"\`. If the changes are unrelated, incomplete, or should not be committed, say so explicitly and ask the user what to do. After committing, verify with \`jj status --no-pager\`.`;
 const CONFIG_PATH = path.join(".pi", "final-review.json");
 const DEFAULT_TIMEOUT_MS = 600_000;
 const LIVE_SNIPPET_CHARS = 600;
@@ -446,6 +452,36 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 async function execText(pi: ExtensionAPI, command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; text: string }> {
 	const result = await pi.exec(command, args, { cwd, signal, timeout: 30_000 });
 	return { code: result.code, text: [result.stdout, result.stderr].filter(Boolean).join("") };
+}
+
+function commitReminderPrompt(kind: CommitReminderVcsKind): string {
+	if (kind === "jj") {
+		return `final-review reminder: this agent turn left uncommitted jj working-copy changes.
+
+Before you finish, inspect \`jj status --no-pager\` and \`jj diff --summary --no-pager\`. If the changes are complete and in scope for this task, run relevant validation and commit them with \`jj commit -m "<conventional commit message>"\`. If the changes are unrelated, incomplete, or should not be committed, say so explicitly and ask the user what to do. After committing, verify with \`jj status --no-pager\`.`;
+	}
+
+	return `final-review reminder: this agent turn left uncommitted git working-tree changes.
+
+Before you finish, inspect \`git status --short\` and \`git diff --stat\` (and \`git diff\` when needed). If the changes are complete and in scope for this task, run relevant validation and commit them with \`git add -A && git commit -m "<conventional commit message>"\`. If the changes are unrelated, incomplete, or should not be committed, say so explicitly and ask the user what to do. After committing, verify with \`git status --short\`.`;
+}
+
+async function commitReminderVcsState(pi: ExtensionAPI, cwd: string, signal?: AbortSignal): Promise<CommitReminderVcsState | undefined> {
+	const jjRoot = await execText(pi, "jj", ["root"], cwd, signal).catch(() => undefined);
+	if (jjRoot && jjRoot.code === 0 && jjRoot.text.trim()) {
+		const summary = await execText(pi, "jj", ["diff", "--summary", "--no-pager"], cwd, signal).catch(() => undefined);
+		const text = summary && summary.code === 0 ? summary.text.trim() : "";
+		return { kind: "jj", root: jjRoot.text.trim(), hasChanges: text.length > 0, summary: text };
+	}
+
+	const gitRoot = await execText(pi, "git", ["rev-parse", "--show-toplevel"], cwd, signal).catch(() => undefined);
+	if (gitRoot && gitRoot.code === 0 && gitRoot.text.trim()) {
+		const status = await execText(pi, "git", ["status", "--short"], cwd, signal).catch(() => undefined);
+		const text = status && status.code === 0 ? status.text.trim() : "";
+		return { kind: "git", root: gitRoot.text.trim(), hasChanges: text.length > 0, summary: text };
+	}
+
+	return undefined;
 }
 
 function shellInvocation(command: string): { command: string; args: string[] } {
@@ -1720,19 +1756,18 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		if (!turnStartSnapshot || unchangedSinceTurnStart(diffHash)) return false;
 		if (hasPendingMessages(ctx)) return false;
 
-		const jjRoot = await execText(pi, "jj", ["root"], ctx.cwd, ctx.signal).catch(() => undefined);
-		if (!jjRoot || jjRoot.code !== 0) return false;
-		const diffSummary = await execText(pi, "jj", ["diff", "--summary", "--no-pager"], ctx.cwd, ctx.signal).catch(() => undefined);
-		if (!diffSummary || diffSummary.code !== 0 || !diffSummary.text.trim()) {
+		const vcsState = await commitReminderVcsState(pi, ctx.cwd, ctx.signal).catch(() => undefined);
+		if (!vcsState) return false;
+		if (!vcsState.hasChanges) {
 			commitReminderDiffs.clear();
 			return false;
 		}
 
-		const reminderKey = `${jjRoot.text.trim()}\0${diffHash}`;
+		const reminderKey = `${vcsState.kind}\0${vcsState.root}\0${diffHash}`;
 		if (commitReminderDiffs.has(reminderKey)) return false;
 		rememberDiffHash(commitReminderDiffs, reminderKey);
-		ctx.ui.notify("jj working-copy changes remain; reminding agent to commit.", "info");
-		pi.sendUserMessage(JJ_COMMIT_REMINDER_PROMPT, { deliverAs: "followUp" });
+		ctx.ui.notify(`${vcsState.kind} changes remain; reminding agent to commit.`, "info");
+		pi.sendUserMessage(commitReminderPrompt(vcsState.kind), { deliverAs: "followUp" });
 		return true;
 	}
 
@@ -2325,6 +2360,8 @@ export const __test__ = {
 	hashText,
 	isDocumentationPath,
 	parseArgs,
+	commitReminderPrompt,
+	commitReminderVcsState,
 	parseChangedPaths,
 	parseCommitReminderConfig,
 	parseReportReference,
@@ -2354,7 +2391,6 @@ export const __test__ = {
 	finalCheckRunKey,
 	finalChecksCommandsHash,
 	finalChecksFollowUpMessage,
-	JJ_COMMIT_REMINDER_PROMPT,
 	resolveFinalCheckCommands,
 	reviewedDiffHashesFromEntries,
 	rememberDiffHash,
