@@ -12,6 +12,7 @@ Project configuration remains in `.pi/final-review.json`.
 {
   "enabled": true,
   "autoReview": true,
+  "requireTurnChanges": true,
   "finalChecks": {
     "enabled": true,
     "commands": [
@@ -70,19 +71,20 @@ devbox run -- bash -lc 'npm run typecheck'
 
 ## Runtime behavior
 
-On `agent_end`, the extension now evaluates automatic finalization in this order:
+On `agent_start`, the extension snapshots the same target fingerprint used for review. On `agent_end`, automatic finalization evaluates in this order:
 
 1. Detect working-copy changes, or a very recent completed jj/git commit when the working copy is clean.
 2. Build the same target bundle/fingerprint used by review.
-3. If `finalChecks.enabled` and root or child commands are configured, resolve the command set for the target diff. Child commands are loaded at run time from child project config files.
-4. Run final checks for the target diff unless the same diff and command set already passed checks.
-5. If any check fails, times out, or is cancelled, send a follow-up user message to the agent with:
+3. If `requireTurnChanges=true` and the target fingerprint is unchanged from `agent_start`, skip automatic final checks/review. Manual `/final-review` and `/final-review checks` commands are unaffected.
+4. If `finalChecks.enabled` and root or child commands are configured, resolve the command set for the target diff. Child commands are loaded at run time from child project config files.
+5. Run final checks for the target diff unless the same diff and command set already passed checks.
+6. If any check fails, times out, or is cancelled, send a follow-up user message to the agent with:
    - target and diff hash
    - every command that ran
    - exit code / outcome
    - captured stdout/stderr for failing commands
    Automatic review is deferred.
-6. If checks pass, remember the diff+command-set as checked and continue to automatic review if `autoReview` is enabled.
+7. If checks pass, remember the diff+command-set as checked and continue to automatic review if `autoReview` is enabled.
 
 Successful check output is visible in Pi's custom report UI but is not sent to the agent as context. The agent only receives command output when there is a failure or other issue.
 

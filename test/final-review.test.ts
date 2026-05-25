@@ -9,6 +9,7 @@ import { __test__ as finalReview } from "../extensions/final-review.ts";
 const config: Parameters<typeof finalReview.parseArgs>[1] = {
 	enabled: true,
 	autoReview: true,
+	requireTurnChanges: true,
 	docsOnlyReview: "ask",
 	defaultMode: "background",
 	reviewers: ["codex", "glm"],
@@ -152,6 +153,7 @@ test("default config is manual, background, and without automatic follow-up", as
 			delete process.env.PI_FINAL_REVIEW_TIMEOUT_MS;
 			const loaded = await finalReview.loadConfig(cwd);
 			assert.equal(loaded.autoReview, false);
+			assert.equal(loaded.requireTurnChanges, true);
 			assert.equal(loaded.defaultMode, "background");
 			assert.equal(loaded.sendFollowUp, false);
 		} finally {

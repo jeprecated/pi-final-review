@@ -70,6 +70,7 @@ type FinalChecksConfig = {
 type FinalReviewConfig = {
 	enabled: boolean;
 	autoReview: boolean;
+	requireTurnChanges: boolean;
 	docsOnlyReview: DocsOnlyReviewMode;
 	defaultMode: ReviewMode;
 	reviewers: ReviewerName[];
@@ -105,6 +106,12 @@ type ReviewBundle = {
 	text: string;
 	target: string;
 	fingerprint: string;
+};
+
+type TurnStartSnapshot = {
+	hash: string;
+	target: string;
+	capturedAt: number;
 };
 
 type AutoReviewTarget = {
@@ -203,6 +210,7 @@ if (DEFAULT_TIMEOUT_MS > MAX_TIMEOUT_MS) throw new Error("Final review default t
 const DEFAULT_CONFIG: FinalReviewConfig = {
 	enabled: true,
 	autoReview: false,
+	requireTurnChanges: true,
 	docsOnlyReview: "ask",
 	defaultMode: "background",
 	reviewers: ["codex", "glm"],
@@ -397,6 +405,7 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 
 	const enabled = typeof local.enabled === "boolean" ? local.enabled : DEFAULT_CONFIG.enabled;
 	const autoReview = typeof local.autoReview === "boolean" ? local.autoReview : DEFAULT_CONFIG.autoReview;
+	const requireTurnChanges = typeof local.requireTurnChanges === "boolean" ? local.requireTurnChanges : DEFAULT_CONFIG.requireTurnChanges;
 	const docsOnlyReview = local.docsOnlyReview === "ask" || local.docsOnlyReview === "auto" || local.docsOnlyReview === "skip" ? local.docsOnlyReview : DEFAULT_CONFIG.docsOnlyReview;
 	const defaultMode = local.defaultMode === "blocking" || local.defaultMode === "background" ? local.defaultMode : DEFAULT_CONFIG.defaultMode;
 	const reviewers = parseReviewerList(local.reviewers) ?? DEFAULT_CONFIG.reviewers;
@@ -407,7 +416,7 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 	const skipDuplicateDiff = typeof local.skipDuplicateDiff === "boolean" ? local.skipDuplicateDiff : DEFAULT_CONFIG.skipDuplicateDiff;
 	const finalChecks = parseFinalChecksConfig(local.finalChecks);
 
-	return { enabled, autoReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks };
+	return { enabled, autoReview, requireTurnChanges, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks };
 }
 
 async function execText(pi: ExtensionAPI, command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; text: string }> {
@@ -1594,6 +1603,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	const checkedDiffs = new Set<string>();
 	const autoAttemptedDiffs = new Set<string>();
 	const autoCheckAttemptedDiffs = new Set<string>();
+	let turnStartSnapshot: TurnStartSnapshot | undefined;
 
 	function setStatus(ctx: ExtensionContext) {
 		if (currentJob) {
@@ -1645,6 +1655,19 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 	function finalChecksConfigured(config: FinalChecksConfig): boolean {
 		return config.enabled && (config.commands.length > 0 || config.childProjects.enabled);
+	}
+
+	function autoFinalizationConfigured(config: FinalReviewConfig): boolean {
+		return config.enabled && (config.autoReview || finalChecksConfigured(config.finalChecks));
+	}
+
+	async function captureTurnStartSnapshot(ctx: ExtensionContext): Promise<TurnStartSnapshot | undefined> {
+		const bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal);
+		return { hash: reviewBundleHash(bundle), target: bundle.target, capturedAt: Date.now() };
+	}
+
+	function unchangedSinceTurnStart(currentHash: string): boolean {
+		return Boolean(turnStartSnapshot && turnStartSnapshot.hash === currentHash);
 	}
 
 	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false): Promise<ReviewReport | undefined> {
@@ -1917,6 +1940,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		});
 		if (!bundle) return;
 		const diffHash = reviewBundleHash(bundle);
+		if (config.requireTurnChanges && unchangedSinceTurnStart(diffHash)) return;
 		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
 		let finalChecksPassedForDiff = false;
 
@@ -1980,8 +2004,19 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		setStatus(ctx);
 	});
 
+	pi.on("agent_start", async (_event, ctx) => {
+		turnStartSnapshot = undefined;
+		const config = await loadConfig(ctx.cwd).catch(() => undefined);
+		if (!config || !autoFinalizationConfigured(config)) return;
+		turnStartSnapshot = await captureTurnStartSnapshot(ctx).catch(() => undefined);
+	});
+
 	pi.on("agent_end", async (_event, ctx) => {
-		await maybeAutoReview(ctx);
+		try {
+			await maybeAutoReview(ctx);
+		} finally {
+			turnStartSnapshot = undefined;
+		}
 	});
 
 	async function handleCommand(args: string, ctx: ExtensionContext) {

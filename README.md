@@ -78,6 +78,7 @@ Example:
 {
   "enabled": true,
   "autoReview": false,
+  "requireTurnChanges": true,
   "docsOnlyReview": "ask",
   "defaultMode": "background",
   "reviewers": ["codex", "glm"],
@@ -180,6 +181,8 @@ Supported reviewers:
 The extension creates read-only SDK sub-agent sessions for review. Reviewer availability depends on your Pi providers, model configuration, and credentials.
 
 ## Auto-review
+
+When `autoReview` or `finalChecks` automation is enabled, the extension snapshots the review target at agent turn start and skips automatic checks/review if the target is unchanged at turn end. This prevents a fresh session from running checks just because the repo was already dirty. Set `requireTurnChanges=false` to restore the old behavior.
 
 When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
 

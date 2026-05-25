@@ -1,6 +1,7 @@
 {
   "enabled": true,
   "autoReview": false,
+  "requireTurnChanges": true,
   "docsOnlyReview": "ask",
   "defaultMode": "background",
   "reviewers": ["codex", "glm"],
