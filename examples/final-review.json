@@ -11,6 +11,9 @@
   "timeoutMs": 600000,
   "sendFollowUp": false,
   "skipDuplicateDiff": true,
+  "commitReminder": {
+    "enabled": true
+  },
   "finalChecks": {
     "enabled": false,
     "commands": [

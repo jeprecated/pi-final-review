@@ -59,6 +59,10 @@ type FinalCheckChildProjectsConfig = {
 	discover: FinalCheckChildProjectDiscover;
 };
 
+type CommitReminderConfig = {
+	enabled: boolean;
+};
+
 type FinalChecksConfig = {
 	enabled: boolean;
 	commands: FinalCheckCommand[];
@@ -82,6 +86,7 @@ type FinalReviewConfig = {
 	sendFollowUp: boolean;
 	skipDuplicateDiff: boolean;
 	finalChecks: FinalChecksConfig;
+	commitReminder: CommitReminderConfig;
 };
 
 type ReviewerResult = {
@@ -200,6 +205,9 @@ const MESSAGE_TYPE = "final-review-report";
 const REVIEWED_DIFF_ENTRY_TYPE = "final-review-reviewed-diff";
 const CHECKED_DIFF_ENTRY_TYPE = "final-review-checked-diff";
 const STATUS_KEY = "final-review";
+const JJ_COMMIT_REMINDER_PROMPT = `final-review reminder: this agent turn left uncommitted jj working-copy changes.
+
+Before you finish, inspect \`jj status --no-pager\` and \`jj diff --summary --no-pager\`. If the changes are complete and in scope for this task, run relevant validation and commit them with \`jj commit -m "<conventional commit message>"\`. If the changes are unrelated, incomplete, or should not be committed, say so explicitly and ask the user what to do. After committing, verify with \`jj status --no-pager\`.`;
 const CONFIG_PATH = path.join(".pi", "final-review.json");
 const DEFAULT_TIMEOUT_MS = 600_000;
 const LIVE_SNIPPET_CHARS = 600;
@@ -240,6 +248,9 @@ const DEFAULT_CONFIG: FinalReviewConfig = {
 				exclude: [".git", ".jj", ".hg", "node_modules", ".direnv", ".devbox"],
 			},
 		},
+	},
+	commitReminder: {
+		enabled: true,
 	},
 };
 
@@ -360,6 +371,14 @@ function parseFinalCheckChildProjectsConfig(value: unknown): FinalCheckChildProj
 	return { enabled, run, projects, defaults, discover };
 }
 
+function parseCommitReminderConfig(value: unknown): CommitReminderConfig {
+	const base = DEFAULT_CONFIG.commitReminder;
+	if (typeof value === "boolean") return { enabled: value };
+	if (!isRecord(value)) return { ...base };
+	const enabled = typeof value.enabled === "boolean" ? value.enabled : base.enabled;
+	return { enabled };
+}
+
 function parseFinalChecksConfig(value: unknown): FinalChecksConfig {
 	const base = DEFAULT_CONFIG.finalChecks;
 	const envTimeoutMs = parseTimeoutMs(process.env.PI_FINAL_REVIEW_CHECK_TIMEOUT_MS);
@@ -419,8 +438,9 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 	const sendFollowUp = typeof local.sendFollowUp === "boolean" ? local.sendFollowUp : DEFAULT_CONFIG.sendFollowUp;
 	const skipDuplicateDiff = typeof local.skipDuplicateDiff === "boolean" ? local.skipDuplicateDiff : DEFAULT_CONFIG.skipDuplicateDiff;
 	const finalChecks = parseFinalChecksConfig(local.finalChecks);
+	const commitReminder = parseCommitReminderConfig(local.commitReminder);
 
-	return { enabled, autoReview, requireTurnChanges, unchangedTurnReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks };
+	return { enabled, autoReview, requireTurnChanges, unchangedTurnReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks, commitReminder };
 }
 
 async function execText(pi: ExtensionAPI, command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; text: string }> {
@@ -1607,6 +1627,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	const checkedDiffs = new Set<string>();
 	const autoAttemptedDiffs = new Set<string>();
 	const autoCheckAttemptedDiffs = new Set<string>();
+	const commitReminderDiffs = new Set<string>();
 	let turnStartSnapshot: TurnStartSnapshot | undefined;
 
 	function setStatus(ctx: ExtensionContext) {
@@ -1684,7 +1705,37 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false): Promise<ReviewReport | undefined> {
+	function hasPendingMessages(ctx: ExtensionContext): boolean {
+		try {
+			return ctx.hasPendingMessages();
+		} catch {
+			return false;
+		}
+	}
+
+	async function maybeSendCommitReminder(ctx: ExtensionContext, config: FinalReviewConfig, autoTarget: AutoReviewTarget, bundle: ReviewBundle, diffHash: string): Promise<boolean> {
+		if (!config.commitReminder.enabled) return false;
+		if (autoTarget.reason !== "working-copy") return false;
+		if (!turnStartSnapshot || unchangedSinceTurnStart(diffHash)) return false;
+		if (hasPendingMessages(ctx)) return false;
+
+		const jjRoot = await execText(pi, "jj", ["root"], ctx.cwd, ctx.signal).catch(() => undefined);
+		if (!jjRoot || jjRoot.code !== 0) return false;
+		const diffSummary = await execText(pi, "jj", ["diff", "--summary", "--no-pager"], ctx.cwd, ctx.signal).catch(() => undefined);
+		if (!diffSummary || diffSummary.code !== 0 || !diffSummary.text.trim()) {
+			commitReminderDiffs.clear();
+			return false;
+		}
+
+		const reminderKey = `${jjRoot.text.trim()}\0${diffHash}`;
+		if (commitReminderDiffs.has(reminderKey)) return false;
+		rememberDiffHash(commitReminderDiffs, reminderKey);
+		ctx.ui.notify("jj working-copy changes remain; reminding agent to commit.", "info");
+		pi.sendUserMessage(JJ_COMMIT_REMINDER_PROMPT, { deliverAs: "followUp" });
+		return true;
+	}
+
+	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false, afterCleanReview?: (report: ReviewReport) => Promise<void>): Promise<ReviewReport | undefined> {
 		if (currentJob) {
 			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
 			return undefined;
@@ -1795,8 +1846,10 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				rememberMapEntry(completedReports, report.id, report, MAX_COMPLETED_REPORTS);
 				removeLiveJob();
 				const sentFollowUp = sendReport(report, steer);
+				const needsAttention = reportNeedsAttention(report);
 				const summary = sentFollowUp ? summarizeReport(report) : `${summarizeReport(report)}. ${finalReportSendHint(report)}`;
-				ctx.ui.notify(summary, reportNeedsAttention(report) ? "warning" : "info");
+				ctx.ui.notify(summary, needsAttention ? "warning" : "info");
+				if (!needsAttention) await afterCleanReview?.(report);
 				return report;
 			} finally {
 				clearInterval(ticker);
@@ -1982,9 +2035,19 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		if (!config.autoReview) return;
-		if (docsOnly && config.docsOnlyReview === "skip") return;
-		if (reviewedDiffs.has(diffHash) || autoAttemptedDiffs.has(diffHash)) return;
+		const remindToCommit = () => maybeSendCommitReminder(ctx, config, autoTarget, bundle, diffHash);
+		if (!config.autoReview) {
+			await remindToCommit();
+			return;
+		}
+		if (docsOnly && config.docsOnlyReview === "skip") {
+			await remindToCommit();
+			return;
+		}
+		if (reviewedDiffs.has(diffHash) || autoAttemptedDiffs.has(diffHash)) {
+			await remindToCommit();
+			return;
+		}
 
 		if (docsOnly && config.docsOnlyReview === "ask") {
 			if (!ctx.hasUI) return;
@@ -1993,12 +2056,17 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			const prompt = finalChecksPassedForDiff ? "Final checks passed. Run final review now?" : "Run final review now?";
 			const ok = await ctx.ui.confirm("Review documentation-only changes?", `${autoTarget.description}:\n\n${preview}${suffix}\n\n${prompt}`);
 			rememberDiffHash(autoAttemptedDiffs, diffHash);
-			if (!ok) return;
+			if (!ok) {
+				await remindToCommit();
+				return;
+			}
 		} else {
 			rememberDiffHash(autoAttemptedDiffs, diffHash);
 		}
 
-		await runReview(ctx, config.defaultMode, config.reviewers, `Automatic review after ${autoTarget.description}.`, shouldAutoReviewSteer(config), autoTarget.targetRev).catch((error) => {
+		await runReview(ctx, config.defaultMode, config.reviewers, `Automatic review after ${autoTarget.description}.`, shouldAutoReviewSteer(config), autoTarget.targetRev, false, async () => {
+			await remindToCommit();
+		}).catch((error) => {
 			ctx.ui.notify(`Final review auto-run failed: ${friendlyErrorMessage(error)}`, "warning");
 		});
 	}
@@ -2073,7 +2141,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Final review config (${CONFIG_PATH} optional):\n` +
 					JSON.stringify(config, null, 2) +
-					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
+					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks. commitReminder.enabled=true sends a jj commit reminder after successful checks/clean review, but only when this turn changed the target. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
 				"info",
 			);
 			return;
@@ -2256,6 +2324,7 @@ export const __test__ = {
 	isDocumentationPath,
 	parseArgs,
 	parseChangedPaths,
+	parseCommitReminderConfig,
 	parseReportReference,
 	parseTimestampMs,
 	isLiveCheckDetails,
@@ -2283,6 +2352,7 @@ export const __test__ = {
 	finalCheckRunKey,
 	finalChecksCommandsHash,
 	finalChecksFollowUpMessage,
+	JJ_COMMIT_REMINDER_PROMPT,
 	resolveFinalCheckCommands,
 	reviewedDiffHashesFromEntries,
 	rememberDiffHash,

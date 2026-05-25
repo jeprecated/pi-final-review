@@ -38,6 +38,9 @@ const config: Parameters<typeof finalReview.parseArgs>[1] = {
 			},
 		},
 	},
+	commitReminder: {
+		enabled: true,
+	},
 };
 
 async function withTempDir<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
@@ -156,6 +159,7 @@ test("default config is manual, background, and without automatic follow-up", as
 			assert.equal(loaded.autoReview, false);
 			assert.equal(loaded.requireTurnChanges, true);
 			assert.equal(loaded.unchangedTurnReview, "ask");
+			assert.equal(loaded.commitReminder.enabled, true);
 			assert.equal(loaded.defaultMode, "background");
 			assert.equal(loaded.sendFollowUp, false);
 		} finally {

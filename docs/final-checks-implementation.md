@@ -14,6 +14,9 @@ Project configuration remains in `.pi/final-review.json`.
   "autoReview": true,
   "requireTurnChanges": true,
   "unchangedTurnReview": "ask",
+  "commitReminder": {
+    "enabled": true
+  },
   "finalChecks": {
     "enabled": true,
     "commands": [
@@ -88,6 +91,8 @@ On `agent_start`, the extension snapshots the same target fingerprint used for r
 7. If checks pass, remember the diff+command-set as checked and continue to automatic review if `autoReview` is enabled.
 
 Successful check output is visible in Pi's custom report UI but is not sent to the agent as context. The agent only receives command output when there is a failure or other issue.
+
+If `commitReminder.enabled=true`, final-review sends a jj commit reminder after final checks pass and no automatic review is pending, or after automatic review completes cleanly. The reminder is part of the automatic finalization pipeline, so it runs when `autoReview` or `finalChecks` automation is active. The reminder is also gated by the turn-start snapshot, so pre-existing dirty changes do not trigger it unless the current turn changed the target.
 
 ## Commands
 
