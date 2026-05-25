@@ -79,6 +79,7 @@ Example:
   "enabled": true,
   "autoReview": false,
   "requireTurnChanges": true,
+  "unchangedTurnReview": "ask",
   "docsOnlyReview": "ask",
   "defaultMode": "background",
   "reviewers": ["codex", "glm"],
@@ -182,7 +183,13 @@ The extension creates read-only SDK sub-agent sessions for review. Reviewer avai
 
 ## Auto-review
 
-When `autoReview` or `finalChecks` automation is enabled, the extension snapshots the review target at agent turn start and skips automatic checks/review if the target is unchanged at turn end. This prevents a fresh session from running checks just because the repo was already dirty. Set `requireTurnChanges=false` to restore the old behavior.
+When `autoReview` or `finalChecks` automation is enabled, the extension snapshots the review target at agent turn start. If the target is unchanged at turn end, `unchangedTurnReview` controls what happens:
+
+- `ask` — offer a yes/no prompt to run checks/review anyway (default).
+- `skip` — silently skip automatic checks/review.
+- `run` — run anyway.
+
+This prevents a fresh session from running checks just because the repo was already dirty, while still letting you opt in from the prompt. Set `requireTurnChanges=false` to restore the old always-run behavior.
 
 When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
 

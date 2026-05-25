@@ -13,6 +13,7 @@ Project configuration remains in `.pi/final-review.json`.
   "enabled": true,
   "autoReview": true,
   "requireTurnChanges": true,
+  "unchangedTurnReview": "ask",
   "finalChecks": {
     "enabled": true,
     "commands": [
@@ -75,8 +76,8 @@ On `agent_start`, the extension snapshots the same target fingerprint used for r
 
 1. Detect working-copy changes, or a very recent completed jj/git commit when the working copy is clean.
 2. Build the same target bundle/fingerprint used by review.
-3. If `requireTurnChanges=true` and the target fingerprint is unchanged from `agent_start`, skip automatic final checks/review. Manual `/final-review` and `/final-review checks` commands are unaffected.
-4. If `finalChecks.enabled` and root or child commands are configured, resolve the command set for the target diff. Child commands are loaded at run time from child project config files.
+3. If `requireTurnChanges=true` and the target fingerprint is unchanged from `agent_start`, follow `unchangedTurnReview`: ask with a yes/no prompt, skip, or run. Manual `/final-review` and `/final-review checks` commands are unaffected.
+4. If the unchanged-turn gate allows the run and `finalChecks.enabled` plus root or child commands are configured, resolve the command set for the target diff. Child commands are loaded at run time from child project config files.
 5. Run final checks for the target diff unless the same diff and command set already passed checks.
 6. If any check fails, times out, or is cancelled, send a follow-up user message to the agent with:
    - target and diff hash

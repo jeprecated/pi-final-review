@@ -19,6 +19,7 @@ type ReviewerName = "codex" | "glm";
 type ReviewOutcome = "success" | "failed" | "timeout" | "skipped" | "cancelled";
 
 type DocsOnlyReviewMode = "ask" | "auto" | "skip";
+type UnchangedTurnReviewMode = "ask" | "skip" | "run";
 
 type FinalCheckCommand = {
 	name: string;
@@ -71,6 +72,7 @@ type FinalReviewConfig = {
 	enabled: boolean;
 	autoReview: boolean;
 	requireTurnChanges: boolean;
+	unchangedTurnReview: UnchangedTurnReviewMode;
 	docsOnlyReview: DocsOnlyReviewMode;
 	defaultMode: ReviewMode;
 	reviewers: ReviewerName[];
@@ -211,6 +213,7 @@ const DEFAULT_CONFIG: FinalReviewConfig = {
 	enabled: true,
 	autoReview: false,
 	requireTurnChanges: true,
+	unchangedTurnReview: "ask",
 	docsOnlyReview: "ask",
 	defaultMode: "background",
 	reviewers: ["codex", "glm"],
@@ -406,6 +409,7 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 	const enabled = typeof local.enabled === "boolean" ? local.enabled : DEFAULT_CONFIG.enabled;
 	const autoReview = typeof local.autoReview === "boolean" ? local.autoReview : DEFAULT_CONFIG.autoReview;
 	const requireTurnChanges = typeof local.requireTurnChanges === "boolean" ? local.requireTurnChanges : DEFAULT_CONFIG.requireTurnChanges;
+	const unchangedTurnReview = local.unchangedTurnReview === "ask" || local.unchangedTurnReview === "skip" || local.unchangedTurnReview === "run" ? local.unchangedTurnReview : DEFAULT_CONFIG.unchangedTurnReview;
 	const docsOnlyReview = local.docsOnlyReview === "ask" || local.docsOnlyReview === "auto" || local.docsOnlyReview === "skip" ? local.docsOnlyReview : DEFAULT_CONFIG.docsOnlyReview;
 	const defaultMode = local.defaultMode === "blocking" || local.defaultMode === "background" ? local.defaultMode : DEFAULT_CONFIG.defaultMode;
 	const reviewers = parseReviewerList(local.reviewers) ?? DEFAULT_CONFIG.reviewers;
@@ -416,7 +420,7 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 	const skipDuplicateDiff = typeof local.skipDuplicateDiff === "boolean" ? local.skipDuplicateDiff : DEFAULT_CONFIG.skipDuplicateDiff;
 	const finalChecks = parseFinalChecksConfig(local.finalChecks);
 
-	return { enabled, autoReview, requireTurnChanges, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks };
+	return { enabled, autoReview, requireTurnChanges, unchangedTurnReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks };
 }
 
 async function execText(pi: ExtensionAPI, command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; text: string }> {
@@ -1670,6 +1674,16 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		return Boolean(turnStartSnapshot && turnStartSnapshot.hash === currentHash);
 	}
 
+	async function shouldProceedForUnchangedTurn(ctx: ExtensionContext, config: FinalReviewConfig, bundle: ReviewBundle, diffHash: string): Promise<boolean> {
+		if (!config.requireTurnChanges || !unchangedSinceTurnStart(diffHash)) return true;
+		if (config.unchangedTurnReview === "run") return true;
+		if (config.unchangedTurnReview === "skip" || !ctx.hasUI) return false;
+		return ctx.ui.confirm(
+			"Run final checks/review for unchanged repo?",
+			`This agent turn did not change the review target. Existing changes are still present.\n\nTarget: ${bundle.target}\nDiff hash: ${diffHash}\n\nRun configured final checks/review anyway?`,
+		);
+	}
+
 	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false): Promise<ReviewReport | undefined> {
 		if (currentJob) {
 			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
@@ -1940,7 +1954,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		});
 		if (!bundle) return;
 		const diffHash = reviewBundleHash(bundle);
-		if (config.requireTurnChanges && unchangedSinceTurnStart(diffHash)) return;
+		if (!await shouldProceedForUnchangedTurn(ctx, config, bundle, diffHash)) return;
 		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
 		let finalChecksPassedForDiff = false;
 
