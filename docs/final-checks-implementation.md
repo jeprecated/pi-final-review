@@ -92,7 +92,7 @@ On `agent_start`, the extension snapshots the same target fingerprint used for r
 
 Successful check output is visible in Pi's custom report UI but is not sent to the agent as context. The agent only receives command output when there is a failure or other issue.
 
-If `commitReminder.enabled=true`, final-review sends a jj commit reminder after final checks pass and no automatic review is pending, or after automatic review completes cleanly. The reminder is part of the automatic finalization pipeline, so it runs when `autoReview` or `finalChecks` automation is active. The reminder is also gated by the turn-start snapshot, so pre-existing dirty changes do not trigger it unless the current turn changed the target.
+If `commitReminder.enabled=true`, final-review sends a jj commit reminder only after final checks pass and no automatic review is pending, or after automatic review completes cleanly. A failed check sends the failing command output instead of a commit reminder. Passing checks with no remaining jj changes send nothing. The reminder is also gated by the turn-start snapshot, so pre-existing dirty changes do not trigger it unless the current turn changed the target.
 
 ## Commands
 

@@ -1713,8 +1713,9 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	async function maybeSendCommitReminder(ctx: ExtensionContext, config: FinalReviewConfig, autoTarget: AutoReviewTarget, bundle: ReviewBundle, diffHash: string): Promise<boolean> {
+	async function maybeSendCommitReminder(ctx: ExtensionContext, config: FinalReviewConfig, autoTarget: AutoReviewTarget, bundle: ReviewBundle, diffHash: string, options: { checksPassed: boolean }): Promise<boolean> {
 		if (!config.commitReminder.enabled) return false;
+		if (finalChecksConfigured(config.finalChecks) && !options.checksPassed) return false;
 		if (autoTarget.reason !== "working-copy") return false;
 		if (!turnStartSnapshot || unchangedSinceTurnStart(diffHash)) return false;
 		if (hasPendingMessages(ctx)) return false;
@@ -2009,7 +2010,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		const diffHash = reviewBundleHash(bundle);
 		if (!await shouldProceedForUnchangedTurn(ctx, config, bundle, diffHash)) return;
 		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
-		let finalChecksPassedForDiff = false;
+		let finalChecksPassedForDiff = !shouldRunChecks;
 
 		if (shouldRunChecks) {
 			const commands = await resolveFinalCheckCommands(ctx.cwd, config.finalChecks, "auto", autoTarget.changedPaths).catch((error) => {
@@ -2017,6 +2018,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				return undefined;
 			});
 			if (!commands) return;
+			if (commands.length === 0) finalChecksPassedForDiff = true;
 			if (commands.length > 0) {
 				const checkKey = finalCheckRunKey(diffHash, commands, config.finalChecks.timeoutMs);
 				if (checkedDiffs.has(checkKey)) {
@@ -2035,7 +2037,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		const remindToCommit = () => maybeSendCommitReminder(ctx, config, autoTarget, bundle, diffHash);
+		const remindToCommit = () => maybeSendCommitReminder(ctx, config, autoTarget, bundle, diffHash, { checksPassed: finalChecksPassedForDiff });
 		if (!config.autoReview) {
 			await remindToCommit();
 			return;

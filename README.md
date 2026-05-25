@@ -194,7 +194,7 @@ When `autoReview` or `finalChecks` automation is enabled, the extension snapshot
 
 This prevents a fresh session from running checks just because the repo was already dirty, while still letting you opt in from the prompt. Set `requireTurnChanges=false` to restore the old always-run behavior.
 
-`commitReminder.enabled=true` adds a final jj reminder step after configured checks pass (and after clean automatic review, when review is enabled). It sends the agent a follow-up to inspect `jj status` / `jj diff --summary` and commit, but only when the current agent turn changed the target. It is part of the automatic finalization pipeline, so it runs when `autoReview` or `finalChecks` automation is active.
+`commitReminder.enabled=true` adds a final jj reminder step only after configured checks have passed (and after clean automatic review, when review is enabled). If checks fail, the agent gets the failing check output instead. If checks pass and jj changes remain, the agent gets the commit reminder. If checks pass and there is nothing to commit, nothing is sent. The reminder is gated to turns that changed the target.
 
 When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
 
