@@ -119,6 +119,8 @@ Example:
 
 `/final-review enable` writes project config with `enabled=true` and `autoReview=true`.
 
+Running final reviews/checks can be cancelled with Escape in interactive mode or `/final-review cancel`.
+
 `finalChecks` runs project commands after agent turns. If a command fails, times out, or is cancelled, the extension sends the command, exit status, and captured output back to the agent as a follow-up and defers automatic review until checks pass. Successful check output is kept in the UI report but is not sent to the agent.
 
 Command entries can be strings or objects with:

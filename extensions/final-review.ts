@@ -1851,6 +1851,10 @@ function compactLiveOneLine(text: string, maxChars = WIDGET_SNIPPET_CHARS): stri
 	return truncateChars(line, maxChars);
 }
 
+function isEscapeInput(data: string): boolean {
+	return data === "\x1b";
+}
+
 function indentLines(text: string, prefix = "  "): string {
 	return text.split(/\n/).map((line) => `${prefix}${line}`).join("\n");
 }
@@ -1975,6 +1979,12 @@ function parseTargetAssignment(token: string): string | undefined {
 
 function looksLikeImplicitTarget(token: string): boolean {
 	return token === "@" || /^@[+-]+$/.test(token) || token.includes("::");
+}
+
+function agentEndWasAborted(event: { messages?: unknown }, signal?: AbortSignal): boolean {
+	if (signal?.aborted) return true;
+	const messages = Array.isArray(event.messages) ? event.messages : [];
+	return messages.some((message) => isRecord(message) && message.role === "assistant" && message.stopReason === "aborted");
 }
 
 function parseArgs(args: string, config: FinalReviewConfig): ParsedFinalReviewArgs {
@@ -2265,8 +2275,15 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		currentJob.promise = promise;
 		const ticker = setInterval(() => setStatus(ctx), 1000);
 		ticker.unref();
+		const unsubscribeInterrupt = ctx.ui.onTerminalInput((data) => {
+			if (!isEscapeInput(data) || currentJob?.id !== id || controller.signal.aborted) return undefined;
+			controller.abort();
+			ctx.ui.notify(`Cancelling final review #${id}.`, "warning");
+			setStatus(ctx);
+			return { consume: true };
+		});
 		setStatus(ctx);
-		if (mode === "background") ctx.ui.notify(`Started final review #${id} (${mode}; ${reviewers.join(", ")}; target: ${bundle.target}).`, "info");
+		if (mode === "background") ctx.ui.notify(`Started final review #${id} (${mode}; ${reviewers.join(", ")}; target: ${bundle.target}). Press Escape or use /final-review cancel to cancel.`, "info");
 
 		const complete = async () => {
 			let liveJobRemoved = false;
@@ -2291,6 +2308,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				return report;
 			} finally {
 				clearInterval(ticker);
+				unsubscribeInterrupt();
 				contextSignal?.removeEventListener("abort", abortFromContext);
 				removeLiveJob();
 				if (currentJob?.id === id) currentJob = undefined;
@@ -2394,8 +2412,15 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		currentCheckJob.promise = promise;
 		const ticker = setInterval(() => setStatus(ctx), 1000);
 		ticker.unref();
+		const unsubscribeInterrupt = ctx.ui.onTerminalInput((data) => {
+			if (!isEscapeInput(data) || currentCheckJob?.id !== id || controller.signal.aborted) return undefined;
+			controller.abort();
+			ctx.ui.notify(`Cancelling final checks #${id}.`, "warning");
+			setStatus(ctx);
+			return { consume: true };
+		});
 		setStatus(ctx);
-		ctx.ui.notify(`Started final checks #${id} (${commands.length} command${commands.length === 1 ? "" : "s"}; target: ${bundle.target}).`, "info");
+		ctx.ui.notify(`Started final checks #${id} (${commands.length} command${commands.length === 1 ? "" : "s"}; target: ${bundle.target}). Press Escape or use /final-review cancel to cancel.`, "info");
 
 		let liveJobRemoved = false;
 		const removeLiveJob = () => {
@@ -2416,6 +2441,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			return report;
 		} finally {
 			clearInterval(ticker);
+			unsubscribeInterrupt();
 			contextSignal?.removeEventListener("abort", abortFromContext);
 			removeLiveJob();
 			if (currentCheckJob?.id === id) currentCheckJob = undefined;
@@ -2541,8 +2567,9 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		noteAgentToolCall(event.toolName, event.input);
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		try {
+			if (agentEndWasAborted(event, ctx.signal)) return;
 			await maybeAutoReview(ctx);
 		} finally {
 			turnStartSnapshot = undefined;
@@ -2774,6 +2801,7 @@ export const __test__ = {
 	getRecentCommitAutoReviewTarget,
 	hashText,
 	isDocumentationPath,
+	isEscapeInput,
 	isReadOnlyShellCommand,
 	parseArgs,
 	buildFinalizationSnapshot,
@@ -2795,6 +2823,7 @@ export const __test__ = {
 	RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS,
 	parseGitStatusPaths,
 	parseGitUntrackedPaths,
+	agentEndWasAborted,
 	applyCommandWrapper,
 	discoverChildProjects,
 	parseFinalCheckChildProjectsConfig,

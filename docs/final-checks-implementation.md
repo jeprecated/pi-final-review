@@ -108,6 +108,7 @@ Commit reminder VCS detection runs for the root and configured/discovered child 
 - `/final-review checks on` sets `finalChecks.enabled=true` in project config.
 - `/final-review checks off` sets `finalChecks.enabled=false` in project config.
 - `/final-review status` and `/final-review cancel` now apply to either a running review or running checks.
+- In interactive mode, Escape also cancels a running final review/check job.
 
 ## Duplicate and loop prevention
 

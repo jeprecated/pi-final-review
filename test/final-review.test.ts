@@ -144,6 +144,21 @@ test("review model parser leaves provider-style model IDs available for fallback
 	});
 });
 
+test("escape input detection supports interactive cancellation", () => {
+	assert.equal(finalReview.isEscapeInput("\x1b"), true);
+	assert.equal(finalReview.isEscapeInput("\x1b[A"), false);
+	assert.equal(finalReview.isEscapeInput("a"), false);
+});
+
+test("agent cancellation suppresses automatic finalization", () => {
+	assert.equal(finalReview.agentEndWasAborted({ messages: [{ role: "assistant", stopReason: "aborted" }] }), true);
+	assert.equal(finalReview.agentEndWasAborted({ messages: [{ role: "assistant", stopReason: "stop" }] }), false);
+
+	const controller = new AbortController();
+	controller.abort();
+	assert.equal(finalReview.agentEndWasAborted({ messages: [] }, controller.signal), true);
+});
+
 test("duration formatting uses minutes for long reviews", () => {
 	assert.equal(finalReview.formatDuration(623_700), "10m 24s");
 });
