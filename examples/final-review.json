@@ -3,6 +3,8 @@
   "autoReview": false,
   "requireTurnChanges": true,
   "unchangedTurnReview": "ask",
+  "requireAgentMutation": true,
+  "readOnlyTurnFinalization": "skip",
   "docsOnlyReview": "ask",
   "defaultMode": "background",
   "reviewers": ["codex", "glm"],

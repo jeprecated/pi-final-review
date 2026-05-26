@@ -11,6 +11,8 @@ const config: Parameters<typeof finalReview.parseArgs>[1] = {
 	autoReview: true,
 	requireTurnChanges: true,
 	unchangedTurnReview: "ask",
+	requireAgentMutation: true,
+	readOnlyTurnFinalization: "skip",
 	docsOnlyReview: "ask",
 	defaultMode: "background",
 	reviewers: ["codex", "glm"],
@@ -159,6 +161,8 @@ test("default config is manual, background, and without automatic follow-up", as
 			assert.equal(loaded.autoReview, false);
 			assert.equal(loaded.requireTurnChanges, true);
 			assert.equal(loaded.unchangedTurnReview, "ask");
+			assert.equal(loaded.requireAgentMutation, true);
+			assert.equal(loaded.readOnlyTurnFinalization, "skip");
 			assert.equal(loaded.commitReminder.enabled, true);
 			assert.equal(loaded.defaultMode, "background");
 			assert.equal(loaded.sendFollowUp, false);
@@ -335,6 +339,21 @@ test("child project final checks can discover nested final-review configs", asyn
 		const commands = await finalReview.resolveFinalCheckCommands(cwd, checks, "manual");
 		assert.deepEqual(commands.map((command) => command.name), ["apps/mobile: npm run build"]);
 	});
+});
+
+test("tool mutation classification distinguishes read-only queries from writes/scripts", () => {
+	assert.equal(finalReview.isReadOnlyShellCommand("rg finalChecks README.md && jj diff --summary --no-pager"), true);
+	assert.equal(finalReview.isReadOnlyShellCommand("git status --short"), true);
+	assert.equal(finalReview.isReadOnlyShellCommand("find src -type f -name '*.ts'"), true);
+	assert.equal(finalReview.isReadOnlyShellCommand("find src -type f -delete"), false);
+	assert.equal(finalReview.isReadOnlyShellCommand("npm test"), false);
+	assert.equal(finalReview.isReadOnlyShellCommand("jj commit -m test"), false);
+	assert.equal(finalReview.classifyToolForFinalization("read", { path: "README.md" }).mutating, false);
+	assert.equal(finalReview.classifyToolForFinalization("bash", { command: "ls && git diff --stat" }).mutating, false);
+	assert.equal(finalReview.classifyToolForFinalization("bash", { command: "npm run build" }).mutating, true);
+	assert.equal(finalReview.classifyToolForFinalization("write", { path: "x", content: "y" }).mutating, true);
+	assert.equal(finalReview.classifyToolForFinalization("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.read", parameters: { path: "README.md" } }, { recipient_name: "functions.bash", parameters: { command: "rg foo" } }] }).mutating, false);
+	assert.equal(finalReview.classifyToolForFinalization("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.write", parameters: { path: "x", content: "y" } }] }).mutating, true);
 });
 
 test("commit reminder prompts support jj and git", () => {

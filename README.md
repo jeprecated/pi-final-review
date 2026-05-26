@@ -80,6 +80,8 @@ Example:
   "autoReview": false,
   "requireTurnChanges": true,
   "unchangedTurnReview": "ask",
+  "requireAgentMutation": true,
+  "readOnlyTurnFinalization": "skip",
   "docsOnlyReview": "ask",
   "defaultMode": "background",
   "reviewers": ["codex", "glm"],
@@ -186,7 +188,15 @@ The extension creates read-only SDK sub-agent sessions for review. Reviewer avai
 
 ## Auto-review
 
-When `autoReview` or `finalChecks` automation is enabled, the extension snapshots an aggregate finalization target at agent turn start. The aggregate includes the root repo and each configured/discovered child repo. Each repo snapshot prefers jj (`jj root`) and falls back to git (`git rev-parse --show-toplevel`). If the aggregate target is unchanged at turn end, `unchangedTurnReview` controls what happens:
+When `autoReview` or `finalChecks` automation is enabled, the extension snapshots an aggregate finalization target at agent turn start. The aggregate includes the root repo and each configured/discovered child repo. Each repo snapshot prefers jj (`jj root`) and falls back to git (`git rev-parse --show-toplevel`).
+
+By default, `requireAgentMutation=true` skips automatic finalization for read-only agent turns. A turn is read-only when it used no tools, or only read-only tools/commands such as `read`, search tools, `rg`, `ls`, `jj status`, `jj diff`, `git status`, and `git diff`. Mutating tools (`edit`, `write`) and non-allowlisted shell commands/scripts (`npm test`, `devbox run`, `jj commit`, unknown custom tools) allow finalization to proceed. `readOnlyTurnFinalization` controls read-only turns:
+
+- `skip` — silently skip automatic checks/review/reminders (default).
+- `ask` — offer a yes/no prompt to run checks/review anyway; a yes answer bypasses the unchanged-turn prompt.
+- `run` — run anyway, bypassing the unchanged-turn prompt.
+
+If the aggregate target is unchanged at turn end, `unchangedTurnReview` controls what happens:
 
 - `ask` — offer a yes/no prompt to run checks/review anyway (default).
 - `skip` — silently skip automatic checks/review.
@@ -209,6 +219,13 @@ snapshot aggregate hash
   |
   v
 agent_end
+  |
+  v
+used mutating tools/scripts this turn?
+  |-- no --> readOnlyTurnFinalization
+  |            |-- ask --> user chooses yes/no
+  |            |-- skip --> stop
+  |            '-- run --> continue
   |
   v
 same aggregate target as snapshot?

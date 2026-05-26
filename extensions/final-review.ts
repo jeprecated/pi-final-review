@@ -20,6 +20,7 @@ type ReviewOutcome = "success" | "failed" | "timeout" | "skipped" | "cancelled";
 
 type DocsOnlyReviewMode = "ask" | "auto" | "skip";
 type UnchangedTurnReviewMode = "ask" | "skip" | "run";
+type ReadOnlyTurnFinalizationMode = "ask" | "skip" | "run";
 
 type FinalCheckCommand = {
 	name: string;
@@ -124,6 +125,8 @@ type FinalReviewConfig = {
 	autoReview: boolean;
 	requireTurnChanges: boolean;
 	unchangedTurnReview: UnchangedTurnReviewMode;
+	requireAgentMutation: boolean;
+	readOnlyTurnFinalization: ReadOnlyTurnFinalizationMode;
 	docsOnlyReview: DocsOnlyReviewMode;
 	defaultMode: ReviewMode;
 	reviewers: ReviewerName[];
@@ -246,6 +249,17 @@ type RunningCheckJob = {
 	progress: FinalCheckProgress[];
 };
 
+type ToolMutationClassification = {
+	mutating: boolean;
+	reason?: string;
+};
+
+type AgentToolActivity = {
+	sawTools: boolean;
+	potentiallyMutating: boolean;
+	reasons: string[];
+};
+
 const MESSAGE_TYPE = "final-review-report";
 const REVIEWED_DIFF_ENTRY_TYPE = "final-review-reviewed-diff";
 const CHECKED_DIFF_ENTRY_TYPE = "final-review-checked-diff";
@@ -266,6 +280,8 @@ const DEFAULT_CONFIG: FinalReviewConfig = {
 	autoReview: false,
 	requireTurnChanges: true,
 	unchangedTurnReview: "ask",
+	requireAgentMutation: true,
+	readOnlyTurnFinalization: "skip",
 	docsOnlyReview: "ask",
 	defaultMode: "background",
 	reviewers: ["codex", "glm"],
@@ -473,6 +489,8 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 	const autoReview = typeof local.autoReview === "boolean" ? local.autoReview : DEFAULT_CONFIG.autoReview;
 	const requireTurnChanges = typeof local.requireTurnChanges === "boolean" ? local.requireTurnChanges : DEFAULT_CONFIG.requireTurnChanges;
 	const unchangedTurnReview = local.unchangedTurnReview === "ask" || local.unchangedTurnReview === "skip" || local.unchangedTurnReview === "run" ? local.unchangedTurnReview : DEFAULT_CONFIG.unchangedTurnReview;
+	const requireAgentMutation = typeof local.requireAgentMutation === "boolean" ? local.requireAgentMutation : DEFAULT_CONFIG.requireAgentMutation;
+	const readOnlyTurnFinalization = local.readOnlyTurnFinalization === "ask" || local.readOnlyTurnFinalization === "skip" || local.readOnlyTurnFinalization === "run" ? local.readOnlyTurnFinalization : DEFAULT_CONFIG.readOnlyTurnFinalization;
 	const docsOnlyReview = local.docsOnlyReview === "ask" || local.docsOnlyReview === "auto" || local.docsOnlyReview === "skip" ? local.docsOnlyReview : DEFAULT_CONFIG.docsOnlyReview;
 	const defaultMode = local.defaultMode === "blocking" || local.defaultMode === "background" ? local.defaultMode : DEFAULT_CONFIG.defaultMode;
 	const reviewers = parseReviewerList(local.reviewers) ?? DEFAULT_CONFIG.reviewers;
@@ -484,7 +502,7 @@ async function loadConfig(cwd: string, configPath = CONFIG_PATH): Promise<FinalR
 	const finalChecks = parseFinalChecksConfig(local.finalChecks);
 	const commitReminder = parseCommitReminderConfig(local.commitReminder);
 
-	return { enabled, autoReview, requireTurnChanges, unchangedTurnReview, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks, commitReminder };
+	return { enabled, autoReview, requireTurnChanges, unchangedTurnReview, requireAgentMutation, readOnlyTurnFinalization, docsOnlyReview, defaultMode, reviewers, codexModel, glmModel, timeoutMs, sendFollowUp, skipDuplicateDiff, finalChecks, commitReminder };
 }
 
 async function execText(pi: ExtensionAPI, command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<{ code: number; text: string }> {
@@ -570,6 +588,113 @@ async function collectCommitReminderStates(pi: ExtensionAPI, root: string, confi
 
 function shellInvocation(command: string): { command: string; args: string[] } {
 	return process.platform === "win32" ? { command: "cmd", args: ["/d", "/s", "/c", command] } : { command: "bash", args: ["-lc", command] };
+}
+
+const READ_ONLY_TOOL_NAMES = new Set(["read", "web_search", "code_search", "fetch_content", "get_search_content", "ask_user", "agent_tick_ask_user"]);
+const MUTATING_TOOL_NAMES = new Set(["edit", "write", "boomerang"]);
+const READ_ONLY_SIMPLE_SHELL_COMMANDS = new Set([
+	"awk", "basename", "cat", "cd", "cut", "date", "df", "dirname", "du", "echo", "fd", "fgrep", "file", "find", "grep", "head", "jq", "less", "ls", "more", "printenv", "ps", "pwd", "realpath", "rg", "sed", "sort", "stat", "tail", "test", "tr", "tree", "true", "type", "uniq", "wc", "which",
+]);
+
+function normalizeToolNameForMutation(toolName: string): string {
+	const lower = toolName.toLowerCase();
+	return lower.split(/[.:/]/).filter(Boolean).at(-1) ?? lower;
+}
+
+function shellWords(segment: string): string[] {
+	return [...segment.matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)].map((match) => match[1] ?? match[2] ?? match[3] ?? "").filter(Boolean);
+}
+
+function firstCommandWords(segment: string): string[] {
+	const words = shellWords(segment);
+	while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!)) words.shift();
+	return words;
+}
+
+function commandBaseName(command: string): string {
+	return path.basename(command).toLowerCase();
+}
+
+function isReadOnlyJjCommand(words: string[]): boolean {
+	let index = 1;
+	while (words[index]?.startsWith("-")) index++;
+	const subcommand = words[index] ? commandBaseName(words[index]!) : "";
+	if (!subcommand) return true;
+	if (["status", "st", "diff", "log", "show", "root"].includes(subcommand)) return true;
+	if (subcommand === "file") return [undefined, "list", "show", "annotate"].includes(words[index + 1]);
+	if (subcommand === "bookmark") return [undefined, "list"].includes(words[index + 1]);
+	if (subcommand === "op") return [undefined, "log", "show", "diff"].includes(words[index + 1]);
+	return false;
+}
+
+function isReadOnlyGitCommand(words: string[]): boolean {
+	let index = 1;
+	while (words[index]?.startsWith("-")) index++;
+	const subcommand = words[index] ? commandBaseName(words[index]!) : "";
+	if (!subcommand) return true;
+	if (["status", "diff", "log", "show", "rev-parse", "ls-files", "grep", "describe", "name-rev", "merge-base", "cat-file"].includes(subcommand)) return true;
+	if (subcommand === "branch") return words.slice(index + 1).every((word) => word.startsWith("-"));
+	if (subcommand === "remote") return [undefined, "-v", "show"].includes(words[index + 1]);
+	if (subcommand === "config") return words.slice(index + 1).some((word) => ["--get", "--get-regexp", "--list", "--name-only", "get", "list"].includes(word));
+	return false;
+}
+
+function isReadOnlyNixCommand(words: string[]): boolean {
+	const subcommand = words[1];
+	if (["eval", "path-info", "show-config"].includes(subcommand ?? "")) return true;
+	return subcommand === "flake" && ["show", "metadata", "info"].includes(words[2] ?? "");
+}
+
+function isReadOnlyShellSegment(segment: string): boolean {
+	const words = firstCommandWords(segment.trim());
+	if (words.length === 0) return true;
+	const command = commandBaseName(words[0]!);
+	if (command === "timeout") {
+		const rest = words.slice(1);
+		while (rest[0]?.startsWith("-")) rest.shift();
+		if (rest.length > 0) rest.shift();
+		return rest.length > 0 && isReadOnlyShellSegment(rest.join(" "));
+	}
+	if (command === "env") {
+		const rest = words.slice(1).filter((word) => !word.startsWith("-") && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
+		return rest.length === 0 || isReadOnlyShellSegment(rest.join(" "));
+	}
+	if (command === "command") return ["-v", "-V"].includes(words[1] ?? "") || (words.length > 1 && isReadOnlyShellSegment(words.slice(1).join(" ")));
+	if (command === "jj") return isReadOnlyJjCommand(words);
+	if (command === "git") return isReadOnlyGitCommand(words);
+	if (command === "nix") return isReadOnlyNixCommand(words);
+	if (command === "find" && words.some((word) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(word))) return false;
+	if (command === "sed" && words.some((word) => word === "-i" || word.startsWith("-i"))) return false;
+	return READ_ONLY_SIMPLE_SHELL_COMMANDS.has(command);
+}
+
+function isReadOnlyShellCommand(command: string): boolean {
+	const trimmed = command.trim();
+	if (!trimmed) return true;
+	if (/(?:^|[^0-9])>>?|<<|`|\$\(|\b(?:eval|exec|source|tee)\b/.test(trimmed)) return false;
+	return trimmed.split(/&&|\|\||;|\n|\|/).map((part) => part.trim()).filter(Boolean).every(isReadOnlyShellSegment);
+}
+
+function classifyToolForFinalization(toolName: string, input: unknown, depth = 0): ToolMutationClassification {
+	const normalized = normalizeToolNameForMutation(toolName);
+	if (depth > 4) return { mutating: true, reason: `${toolName} nested tool call` };
+	if (toolName.toLowerCase() === "multi_tool_use.parallel" || normalized === "parallel") {
+		const toolUses = isRecord(input) && Array.isArray(input.tool_uses) ? input.tool_uses : undefined;
+		if (!toolUses) return { mutating: true, reason: `${toolName} tool call` };
+		for (const toolUse of toolUses) {
+			if (!isRecord(toolUse) || typeof toolUse.recipient_name !== "string") return { mutating: true, reason: `${toolName} tool call` };
+			const child = classifyToolForFinalization(toolUse.recipient_name, toolUse.parameters, depth + 1);
+			if (child.mutating) return child;
+		}
+		return { mutating: false };
+	}
+	if (normalized === "bash") {
+		const command = isRecord(input) && typeof input.command === "string" ? input.command : "";
+		return isReadOnlyShellCommand(command) ? { mutating: false } : { mutating: true, reason: command ? `bash: ${defaultCheckName(command)}` : "bash" };
+	}
+	if (MUTATING_TOOL_NAMES.has(normalized)) return { mutating: true, reason: normalized };
+	if (READ_ONLY_TOOL_NAMES.has(normalized)) return { mutating: false };
+	return { mutating: true, reason: `${toolName} tool` };
 }
 
 function resolveFinalCheckCwd(root: string, check: FinalCheckCommand): { cwd: string; displayCwd?: string } {
@@ -1916,6 +2041,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	const autoCheckAttemptedDiffs = new Set<string>();
 	const commitReminderDiffs = new Set<string>();
 	let turnStartSnapshot: TurnStartSnapshot | undefined;
+	let agentToolActivity: AgentToolActivity | undefined;
 
 	function setStatus(ctx: ExtensionContext) {
 		if (currentJob) {
@@ -1980,6 +2106,30 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 	function unchangedSinceTurnStart(currentHash: string): boolean {
 		return Boolean(turnStartSnapshot && turnStartSnapshot.hash === currentHash);
+	}
+
+	function noteAgentToolCall(toolName: string, input: unknown) {
+		if (!agentToolActivity) return;
+		agentToolActivity.sawTools = true;
+		const classification = classifyToolForFinalization(toolName, input);
+		if (!classification.mutating) return;
+		agentToolActivity.potentiallyMutating = true;
+		if (classification.reason) agentToolActivity.reasons.push(classification.reason);
+	}
+
+	function currentAgentTurnReadOnly(): boolean {
+		return Boolean(agentToolActivity && !agentToolActivity.potentiallyMutating);
+	}
+
+	async function shouldProceedForReadOnlyTurn(ctx: ExtensionContext, config: FinalReviewConfig, bundle: ReviewBundle, diffHash: string): Promise<boolean> {
+		if (!config.requireAgentMutation || !currentAgentTurnReadOnly()) return true;
+		if (config.readOnlyTurnFinalization === "run") return true;
+		if (config.readOnlyTurnFinalization === "skip" || !ctx.hasUI) return false;
+		const toolSummary = agentToolActivity?.sawTools ? "This agent turn only used read-only tools." : "This agent turn did not use any tools.";
+		return ctx.ui.confirm(
+			"Run final checks/review for read-only agent turn?",
+			`${toolSummary}\n\nTarget: ${bundle.target}\nDiff hash: ${diffHash}\n\nRun configured final checks/review anyway?`,
+		);
 	}
 
 	async function shouldProceedForUnchangedTurn(ctx: ExtensionContext, config: FinalReviewConfig, bundle: ReviewBundle, diffHash: string): Promise<boolean> {
@@ -2292,7 +2442,9 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		const bundle = finalization.bundle;
 		const diffHash = finalization.hash;
 		const aggregateUnchanged = unchangedSinceTurnStart(diffHash);
-		if (!await shouldProceedForUnchangedTurn(ctx, config, bundle, diffHash)) return;
+		const readOnlyGateApplies = config.requireAgentMutation && currentAgentTurnReadOnly();
+		if (!await shouldProceedForReadOnlyTurn(ctx, config, bundle, diffHash)) return;
+		if (!readOnlyGateApplies && !await shouldProceedForUnchangedTurn(ctx, config, bundle, diffHash)) return;
 		const turnActiveRepos = aggregateUnchanged ? finalization.activeRepos : activeReposChangedSinceSnapshot(finalization, turnStartSnapshot);
 		const turnChangedPaths = changedPathsForRepos(turnActiveRepos);
 		const turnChangedChildProjectPaths = changedChildProjectPathsForRepos(turnActiveRepos);
@@ -2378,9 +2530,15 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		turnStartSnapshot = undefined;
+		agentToolActivity = undefined;
 		const config = await loadConfig(ctx.cwd).catch(() => undefined);
 		if (!config || !autoFinalizationConfigured(config)) return;
+		agentToolActivity = { sawTools: false, potentiallyMutating: false, reasons: [] };
 		turnStartSnapshot = await captureTurnStartSnapshot(ctx, config).catch(() => undefined);
+	});
+
+	pi.on("tool_call", async (event) => {
+		noteAgentToolCall(event.toolName, event.input);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -2388,6 +2546,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			await maybeAutoReview(ctx);
 		} finally {
 			turnStartSnapshot = undefined;
+			agentToolActivity = undefined;
 		}
 	});
 
@@ -2431,7 +2590,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Final review config (${CONFIG_PATH} optional):\n` +
 					JSON.stringify(config, null, 2) +
-					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks; automatic finalization snapshots include configured/discovered child repos so child-only changes can trigger checks. commitReminder.enabled=true sends a jj/git commit reminder after successful checks/clean review, but only when this turn changed the aggregate target. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
+					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. requireAgentMutation=true with readOnlyTurnFinalization=skip avoids automatic checks/review/reminders for turns that used only read-only tools or no tools. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks; automatic finalization snapshots include configured/discovered child repos so child-only changes can trigger checks. commitReminder.enabled=true sends a jj/git commit reminder after successful checks/clean review, but only when this turn changed the aggregate target. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
 				"info",
 			);
 			return;
@@ -2615,8 +2774,10 @@ export const __test__ = {
 	getRecentCommitAutoReviewTarget,
 	hashText,
 	isDocumentationPath,
+	isReadOnlyShellCommand,
 	parseArgs,
 	buildFinalizationSnapshot,
+	classifyToolForFinalization,
 	commitReminderPrompt,
 	commitReminderPromptForStates,
 	commitReminderVcsState,
