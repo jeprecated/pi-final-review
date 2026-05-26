@@ -72,6 +72,44 @@ type CommitReminderVcsState = {
 	summary: string;
 };
 
+type CommitReminderRepoState = CommitReminderVcsState & {
+	key: string;
+	label: string;
+	cwd: string;
+};
+
+type RepoActivity = {
+	reason: "working-copy" | "recent-commit";
+	changedPaths: string[];
+	targetRev?: string;
+	description: string;
+};
+
+type RepoFinalizationSnapshot = {
+	key: string;
+	label: string;
+	cwd: string;
+	isRoot: boolean;
+	projectPath?: string;
+	vcs?: CommitReminderVcsKind;
+	vcsRoot?: string;
+	fingerprint: string;
+	dirty: boolean;
+	activity?: RepoActivity;
+	bundle?: ReviewBundle;
+};
+
+type FinalizationSnapshot = {
+	hash: string;
+	target: string;
+	description: string;
+	bundle: ReviewBundle;
+	repos: RepoFinalizationSnapshot[];
+	activeRepos: RepoFinalizationSnapshot[];
+	changedPaths: string[];
+	changedChildProjectPaths: string[];
+};
+
 type FinalChecksConfig = {
 	enabled: boolean;
 	commands: FinalCheckCommand[];
@@ -124,9 +162,7 @@ type ReviewBundle = {
 	fingerprint: string;
 };
 
-type TurnStartSnapshot = {
-	hash: string;
-	target: string;
+type TurnStartSnapshot = FinalizationSnapshot & {
 	capturedAt: number;
 };
 
@@ -220,6 +256,8 @@ const LIVE_SNIPPET_CHARS = 600;
 const WIDGET_SNIPPET_CHARS = 120;
 const MAX_TIMEOUT_MS = 600_000;
 const RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS = 60_000;
+const MAX_UNTRACKED_HASH_FILES = 200;
+const MAX_UNTRACKED_HASH_BYTES = 1_000_000;
 // Completed reports retain reviewer output, so keep fewer than lightweight diff-hash caches.
 const MAX_COMPLETED_REPORTS = 32;
 if (DEFAULT_TIMEOUT_MS > MAX_TIMEOUT_MS) throw new Error("Final review default timeout exceeds maximum timeout cap");
@@ -484,6 +522,52 @@ async function commitReminderVcsState(pi: ExtensionAPI, cwd: string, signal?: Ab
 	return undefined;
 }
 
+function commitReminderCommands(state: CommitReminderRepoState): string[] {
+	const cd = `cd ${shellQuote(state.cwd)}`;
+	if (state.kind === "jj") return [`${cd} && jj status --no-pager`, `${cd} && jj diff --summary --no-pager`, `${cd} && jj commit -m "<conventional commit message>"`, `${cd} && jj status --no-pager`];
+	return [`${cd} && git status --short`, `${cd} && git diff --stat`, `${cd} && git add -A && git commit -m "<conventional commit message>"`, `${cd} && git status --short`];
+}
+
+function summarizeCommitReminderState(state: CommitReminderRepoState): string {
+	const summary = state.summary.split(/\r?\n/).filter(Boolean).slice(0, 6).join("; ");
+	const suffix = state.summary.split(/\r?\n/).filter(Boolean).length > 6 ? "; ..." : "";
+	return `- ${state.label} (${state.kind}): ${summary || "dirty"}${suffix}`;
+}
+
+function commitReminderPromptForStates(states: CommitReminderRepoState[]): string {
+	if (states.length === 1 && states[0]!.label === ".") return commitReminderPrompt(states[0]!.kind);
+	const repoList = states.map(summarizeCommitReminderState).join("\n");
+	const commandList = states.flatMap((state) => [`${state.label} (${state.kind}):`, ...commitReminderCommands(state).map((command) => `  ${command}`)]).join("\n");
+	return `final-review reminder: this agent turn left uncommitted working-copy changes in ${states.length} repo${states.length === 1 ? "" : "s"}.
+
+Repos with remaining changes:
+${repoList}
+
+Before you finish, inspect and commit each repo whose changes are complete and in scope:
+${commandList}
+
+If any changes are unrelated, incomplete, or should not be committed, say so explicitly and ask the user what to do. After committing, verify that each repo is clean.`;
+}
+
+async function collectCommitReminderStates(pi: ExtensionAPI, root: string, config: FinalReviewConfig, signal?: AbortSignal): Promise<CommitReminderRepoState[]> {
+	const states: CommitReminderRepoState[] = [];
+	const rootState = await commitReminderVcsState(pi, root, signal).catch(() => undefined);
+	if (rootState) states.push({ ...rootState, key: ".", label: ".", cwd: root });
+	for (const project of await resolveConfiguredChildProjects(root, config.finalChecks.childProjects)) {
+		const displayPath = childProjectDisplayPath(root, project.path);
+		const cwd = resolveProjectPath(root, project.path);
+		const state = await commitReminderVcsState(pi, cwd, signal).catch(() => undefined);
+		if (state) states.push({ ...state, key: displayPath, label: project.name ?? displayPath, cwd });
+	}
+	const seen = new Set<string>();
+	return states.filter((state) => {
+		const key = `${state.kind}\0${state.root}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
 function shellInvocation(command: string): { command: string; args: string[] } {
 	return process.platform === "win32" ? { command: "cmd", args: ["/d", "/s", "/c", command] } : { command: "bash", args: ["-lc", command] };
 }
@@ -552,10 +636,13 @@ function changedPathsAffectProject(root: string, projectPath: string, changedPat
 	});
 }
 
-function shouldRunChildProject(source: "auto" | "manual", runMode: ChildProjectRunMode, root: string, projectPath: string, changedPaths: string[]): boolean {
+function shouldRunChildProject(source: "auto" | "manual", runMode: ChildProjectRunMode, root: string, projectPath: string, changedPaths: string[], changedChildProjectPaths: string[] = []): boolean {
 	if (source === "manual") return true;
 	if (runMode === "manual") return false;
-	if (runMode === "changed") return changedPathsAffectProject(root, projectPath, changedPaths);
+	if (runMode === "changed") {
+		const displayPath = childProjectDisplayPath(root, projectPath);
+		return changedChildProjectPaths.includes(displayPath) || changedPathsAffectProject(root, projectPath, changedPaths);
+	}
 	return true;
 }
 
@@ -605,11 +692,8 @@ async function discoverChildProjects(root: string, discover: FinalCheckChildProj
 	return projects;
 }
 
-async function resolveFinalCheckCommands(root: string, checksConfig: FinalChecksConfig, source: "auto" | "manual", changedPaths: string[] = []): Promise<FinalCheckCommand[]> {
-	const commands: FinalCheckCommand[] = [...checksConfig.commands];
-	const childProjectsConfig = checksConfig.childProjects;
-	if (!childProjectsConfig.enabled) return commands;
-
+async function resolveConfiguredChildProjects(root: string, childProjectsConfig: FinalCheckChildProjectsConfig): Promise<FinalCheckChildProject[]> {
+	if (!childProjectsConfig.enabled) return [];
 	const explicitProjects = childProjectsConfig.projects;
 	const discoveredProjects = await discoverChildProjects(root, childProjectsConfig.discover);
 	const projects = new Map<string, FinalCheckChildProject>();
@@ -618,10 +702,17 @@ async function resolveFinalCheckCommands(root: string, checksConfig: FinalChecks
 		const key = childProjectDisplayPath(root, project.path);
 		if (!projects.has(key)) projects.set(key, project);
 	}
+	return [...projects.values()].filter((project) => project.enabled);
+}
 
-	for (const project of projects.values()) {
-		if (!project.enabled) continue;
-		if (!shouldRunChildProject(source, childProjectsConfig.run, root, project.path, changedPaths)) continue;
+async function resolveFinalCheckCommands(root: string, checksConfig: FinalChecksConfig, source: "auto" | "manual", changedPaths: string[] = [], changedChildProjectPaths: string[] = []): Promise<FinalCheckCommand[]> {
+	const commands: FinalCheckCommand[] = [...checksConfig.commands];
+	const childProjectsConfig = checksConfig.childProjects;
+	if (!childProjectsConfig.enabled) return commands;
+
+	const projects = await resolveConfiguredChildProjects(root, childProjectsConfig);
+	for (const project of projects) {
+		if (!shouldRunChildProject(source, childProjectsConfig.run, root, project.path, changedPaths, changedChildProjectPaths)) continue;
 		const childRoot = resolveProjectPath(root, project.path);
 		const displayPath = childProjectDisplayPath(root, project.path);
 		const childConfig = await loadConfig(childRoot, project.configPath ?? childProjectsConfig.discover.configPath);
@@ -754,6 +845,41 @@ function parseGitStatusPaths(output: string): string[] {
 		});
 }
 
+function parseGitUntrackedPaths(output: string): string[] {
+	return output
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.startsWith("?? "))
+		.map((line) => unquoteGitPath(line.slice(3).trim()))
+		.filter(Boolean);
+}
+
+async function gitUntrackedFingerprint(pi: ExtensionAPI, cwd: string, signal?: AbortSignal): Promise<string> {
+	const listed = await execText(pi, "git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd, signal).catch(() => undefined);
+	const files = listed && listed.code === 0 ? listed.text.split("\0").filter(Boolean).slice(0, MAX_UNTRACKED_HASH_FILES) : [];
+	const lines: string[] = [];
+	for (const file of files) {
+		const absolute = path.resolve(cwd, file);
+		try {
+			const stat = await fs.stat(absolute);
+			if (!stat.isFile()) {
+				lines.push(`${file}\t${stat.isDirectory() ? "directory" : "non-file"}`);
+				continue;
+			}
+			if (stat.size > MAX_UNTRACKED_HASH_BYTES) {
+				lines.push(`${file}\tlarge\t${stat.size}\t${Math.trunc(stat.mtimeMs)}`);
+				continue;
+			}
+			const content = await fs.readFile(absolute);
+			lines.push(`${file}\t${stat.size}\t${createHash("sha256").update(content).digest("hex")}`);
+		} catch (error) {
+			lines.push(`${file}\terror\t${errorMessage(error)}`);
+		}
+	}
+	if (listed && listed.code === 0 && listed.text.split("\0").filter(Boolean).length > MAX_UNTRACKED_HASH_FILES) lines.push(`[truncated after ${MAX_UNTRACKED_HASH_FILES} untracked files]`);
+	return lines.join("\n");
+}
+
 function isDocumentationPath(filePath: string): boolean {
 	const normalized = filePath.toLowerCase();
 	const basename = path.basename(normalized);
@@ -854,6 +980,131 @@ async function buildReviewBundle(pi: ExtensionAPI, cwd: string, signal?: AbortSi
 	sections.push("Review target: " + target);
 	sections.push("No jj or git repository detected. Reviewers may need to inspect files directly.");
 	return { target, fingerprint: "no-vcs", text: sections.join("\n\n") + "\n" };
+}
+
+function repoActivityDescription(label: string, activity: RepoActivity): string {
+	return label === "." ? activity.description : `${label} ${activity.description}`;
+}
+
+function prefixRepoChangedPath(repo: RepoFinalizationSnapshot, changedPath: string): string {
+	const normalized = normalizePathForConfig(changedPath);
+	if (repo.isRoot || !repo.projectPath) return normalized;
+	return joinConfigPaths(repo.projectPath, normalized) ?? repo.projectPath;
+}
+
+async function buildJjFinalizationSnapshot(pi: ExtensionAPI, entry: { key: string; label: string; cwd: string; isRoot: boolean; projectPath?: string }, jjRoot: string, signal?: AbortSignal): Promise<RepoFinalizationSnapshot> {
+	const nameOnly = await execText(pi, "jj", ["diff", "--name-only", "--no-pager"], entry.cwd, signal);
+	const changedPaths = parseChangedPaths(nameOnly.text);
+	const diff = await execText(pi, "jj", ["diff", "--no-pager"], entry.cwd, signal);
+	if (changedPaths.length > 0 || diff.text.trim()) {
+		const activity: RepoActivity = { reason: "working-copy", changedPaths, description: "working-copy changes" };
+		const bundle = await buildReviewBundle(pi, entry.cwd, signal);
+		return { ...entry, vcs: "jj", vcsRoot: jjRoot, fingerprint: `jj-working\n${diff.text.trimEnd()}\n--names--\n${changedPaths.join("\n")}`, dirty: true, activity, bundle };
+	}
+
+	const parentId = await execText(pi, "jj", ["log", "-r", "@-", "--no-graph", "--no-pager", "--template", "commit_id ++ \"\\n\""], entry.cwd, signal).catch(() => undefined);
+	const recent = await getRecentCommitAutoReviewTarget(pi, entry.cwd, signal).catch(() => undefined);
+	if (recent?.reason === "recent-commit") {
+		const activity: RepoActivity = { reason: "recent-commit", changedPaths: recent.changedPaths, targetRev: recent.targetRev, description: recent.description };
+		const bundle = await buildReviewBundle(pi, entry.cwd, signal, recent.targetRev);
+		return { ...entry, vcs: "jj", vcsRoot: jjRoot, fingerprint: `jj-clean\n${parentId?.text.trim() ?? "unknown-parent"}`, dirty: false, activity, bundle };
+	}
+
+	return { ...entry, vcs: "jj", vcsRoot: jjRoot, fingerprint: `jj-clean\n${parentId?.text.trim() ?? "unknown-parent"}`, dirty: false };
+}
+
+async function buildGitFinalizationSnapshot(pi: ExtensionAPI, entry: { key: string; label: string; cwd: string; isRoot: boolean; projectPath?: string }, gitRoot: string, signal?: AbortSignal): Promise<RepoFinalizationSnapshot> {
+	const status = await execText(pi, "git", ["status", "--short"], entry.cwd, signal);
+	const statusText = status.text.trimEnd();
+	if (statusText.trim()) {
+		const changedPaths = parseGitStatusPaths(status.text);
+		const diff = await execText(pi, "git", ["diff", "--no-ext-diff"], entry.cwd, signal);
+		const stagedDiff = await execText(pi, "git", ["diff", "--cached", "--no-ext-diff"], entry.cwd, signal);
+		const untracked = parseGitUntrackedPaths(status.text).length > 0 ? await gitUntrackedFingerprint(pi, entry.cwd, signal) : "";
+		const activity: RepoActivity = { reason: "working-copy", changedPaths, description: "git working tree and index changes" };
+		const bundle = await buildReviewBundle(pi, entry.cwd, signal);
+		return { ...entry, vcs: "git", vcsRoot: gitRoot, fingerprint: `git-dirty\n${statusText}\n--unstaged--\n${diff.text.trimEnd()}\n--staged--\n${stagedDiff.text.trimEnd()}\n--untracked--\n${untracked}`, dirty: true, activity, bundle };
+	}
+
+	const head = await execText(pi, "git", ["rev-parse", "HEAD"], entry.cwd, signal).catch(() => undefined);
+	const recent = await getRecentCommitAutoReviewTarget(pi, entry.cwd, signal).catch(() => undefined);
+	if (recent?.reason === "recent-commit") {
+		const activity: RepoActivity = { reason: "recent-commit", changedPaths: recent.changedPaths, targetRev: recent.targetRev, description: recent.description };
+		const bundle = await buildReviewBundle(pi, entry.cwd, signal, recent.targetRev);
+		return { ...entry, vcs: "git", vcsRoot: gitRoot, fingerprint: `git-clean\n${head?.text.trim() ?? "unknown-head"}`, dirty: false, activity, bundle };
+	}
+
+	return { ...entry, vcs: "git", vcsRoot: gitRoot, fingerprint: `git-clean\n${head?.text.trim() ?? "unknown-head"}`, dirty: false };
+}
+
+async function buildRepoFinalizationSnapshot(pi: ExtensionAPI, entry: { key: string; label: string; cwd: string; isRoot: boolean; projectPath?: string }, signal?: AbortSignal): Promise<RepoFinalizationSnapshot> {
+	const jjRoot = await execText(pi, "jj", ["root"], entry.cwd, signal).catch(() => undefined);
+	if (jjRoot && jjRoot.code === 0 && jjRoot.text.trim()) return buildJjFinalizationSnapshot(pi, entry, jjRoot.text.trim(), signal);
+
+	const gitRoot = await execText(pi, "git", ["rev-parse", "--show-toplevel"], entry.cwd, signal).catch(() => undefined);
+	if (gitRoot && gitRoot.code === 0 && gitRoot.text.trim()) return buildGitFinalizationSnapshot(pi, entry, gitRoot.text.trim(), signal);
+
+	return { ...entry, fingerprint: "no-vcs", dirty: false };
+}
+
+function buildAggregateFinalizationBundle(root: string, repos: RepoFinalizationSnapshot[]): ReviewBundle {
+	if (repos.length === 1 && repos[0]?.bundle) return repos[0].bundle;
+	const activeRepos = repos.filter((repo) => repo.activity && repo.bundle);
+	const activeDescriptions = activeRepos.map((repo) => repoActivityDescription(repo.label, repo.activity!));
+	const target = activeDescriptions.length === 0
+		? "no active finalization changes"
+		: activeDescriptions.length === 1 ? activeDescriptions[0]! : `aggregate workspace changes (${activeDescriptions.join("; ")})`;
+	const inventory = repos.map((repo) => `- ${repo.label} (${repo.vcs ?? "no-vcs"}): ${repo.activity ? repo.activity.description : repo.dirty ? "dirty" : "clean"}`).join("\n");
+	const sections = [`Repository: ${root}`, `Review target: ${target}`, `Included repositories:\n${inventory}`];
+	for (const repo of activeRepos) {
+		sections.push(`## ${repo.label}\n${repo.bundle!.text.trimEnd()}`);
+	}
+	if (activeRepos.length === 0) sections.push("No current working-copy or recent-commit changes were detected in the root or configured child projects.");
+	const fingerprint = `aggregate-finalization\n${repos.map((repo) => `${repo.key}\t${repo.cwd}\t${repo.vcs ?? "none"}\t${repo.fingerprint}`).join("\n---\n")}`;
+	return { target, fingerprint, text: sections.join("\n\n") + "\n" };
+}
+
+async function buildFinalizationSnapshot(pi: ExtensionAPI, root: string, config: FinalReviewConfig, signal?: AbortSignal): Promise<FinalizationSnapshot> {
+	const entries: Array<{ key: string; label: string; cwd: string; isRoot: boolean; projectPath?: string }> = [{ key: ".", label: ".", cwd: root, isRoot: true }];
+	for (const project of await resolveConfiguredChildProjects(root, config.finalChecks.childProjects)) {
+		const displayPath = childProjectDisplayPath(root, project.path);
+		entries.push({ key: displayPath, label: project.name ?? displayPath, cwd: resolveProjectPath(root, project.path), isRoot: false, projectPath: displayPath });
+	}
+
+	const repos: RepoFinalizationSnapshot[] = [];
+	const seenKeys = new Set<string>();
+	for (const entry of entries) {
+		if (seenKeys.has(entry.key)) continue;
+		seenKeys.add(entry.key);
+		repos.push(await buildRepoFinalizationSnapshot(pi, entry, signal));
+	}
+	const activeRepos = repos.filter((repo) => repo.activity);
+	const changedPaths = activeRepos.flatMap((repo) => repo.activity!.changedPaths.map((changedPath) => prefixRepoChangedPath(repo, changedPath)));
+	const changedChildProjectPaths = activeRepos.flatMap((repo) => repo.isRoot || !repo.projectPath ? [] : [repo.projectPath]);
+	const bundle = buildAggregateFinalizationBundle(root, repos);
+	const hash = reviewBundleHash(bundle);
+	const description = activeRepos.length === 0
+		? "no active changes"
+		: activeRepos.length === 1 ? repoActivityDescription(activeRepos[0]!.label, activeRepos[0]!.activity!) : `${activeRepos.length} repository change sets`;
+	return { hash, target: bundle.target, description, bundle, repos, activeRepos, changedPaths, changedChildProjectPaths };
+}
+
+function repoChangedSinceSnapshot(repo: RepoFinalizationSnapshot, snapshot: FinalizationSnapshot | undefined): boolean {
+	if (!snapshot) return true;
+	const previous = snapshot.repos.find((item) => item.key === repo.key);
+	return !previous || previous.fingerprint !== repo.fingerprint;
+}
+
+function activeReposChangedSinceSnapshot(finalization: FinalizationSnapshot, snapshot: FinalizationSnapshot | undefined): RepoFinalizationSnapshot[] {
+	return finalization.activeRepos.filter((repo) => repoChangedSinceSnapshot(repo, snapshot));
+}
+
+function changedPathsForRepos(repos: RepoFinalizationSnapshot[]): string[] {
+	return repos.flatMap((repo) => repo.activity?.changedPaths.map((changedPath) => prefixRepoChangedPath(repo, changedPath)) ?? []);
+}
+
+function changedChildProjectPathsForRepos(repos: RepoFinalizationSnapshot[]): string[] {
+	return repos.flatMap((repo) => repo.isRoot || !repo.projectPath ? [] : [repo.projectPath]);
 }
 
 function reviewBundleHash(bundle: ReviewBundle): string {
@@ -1722,9 +1973,9 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		return config.enabled && (config.autoReview || finalChecksConfigured(config.finalChecks));
 	}
 
-	async function captureTurnStartSnapshot(ctx: ExtensionContext): Promise<TurnStartSnapshot | undefined> {
-		const bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal);
-		return { hash: reviewBundleHash(bundle), target: bundle.target, capturedAt: Date.now() };
+	async function captureTurnStartSnapshot(ctx: ExtensionContext, config: FinalReviewConfig): Promise<TurnStartSnapshot | undefined> {
+		const snapshot = await buildFinalizationSnapshot(pi, ctx.cwd, config, ctx.signal);
+		return { ...snapshot, capturedAt: Date.now() };
 	}
 
 	function unchangedSinceTurnStart(currentHash: string): boolean {
@@ -1749,29 +2000,30 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	async function maybeSendCommitReminder(ctx: ExtensionContext, config: FinalReviewConfig, autoTarget: AutoReviewTarget, bundle: ReviewBundle, diffHash: string, options: { checksPassed: boolean }): Promise<boolean> {
+	async function maybeSendCommitReminder(ctx: ExtensionContext, config: FinalReviewConfig, finalization: FinalizationSnapshot, diffHash: string, options: { checksPassed: boolean }): Promise<boolean> {
 		if (!config.commitReminder.enabled) return false;
 		if (finalChecksConfigured(config.finalChecks) && !options.checksPassed) return false;
-		if (autoTarget.reason !== "working-copy") return false;
 		if (!turnStartSnapshot || unchangedSinceTurnStart(diffHash)) return false;
 		if (hasPendingMessages(ctx)) return false;
 
-		const vcsState = await commitReminderVcsState(pi, ctx.cwd, ctx.signal).catch(() => undefined);
-		if (!vcsState) return false;
-		if (!vcsState.hasChanges) {
+		const changedRepoKeys = new Set(activeReposChangedSinceSnapshot(finalization, turnStartSnapshot).map((repo) => repo.key));
+		const dirtyStates = (await collectCommitReminderStates(pi, ctx.cwd, config, ctx.signal)).filter((state) => state.hasChanges && changedRepoKeys.has(state.key));
+		if (dirtyStates.length === 0) {
 			commitReminderDiffs.clear();
 			return false;
 		}
 
-		const reminderKey = `${vcsState.kind}\0${vcsState.root}\0${diffHash}`;
+		const stateHash = hashText(dirtyStates.map((state) => `${state.kind}\0${state.root}\0${state.summary}`).join("\n"));
+		const reminderKey = `${diffHash}\0${stateHash}`;
 		if (commitReminderDiffs.has(reminderKey)) return false;
 		rememberDiffHash(commitReminderDiffs, reminderKey);
-		ctx.ui.notify(`${vcsState.kind} changes remain; reminding agent to commit.`, "info");
-		pi.sendUserMessage(commitReminderPrompt(vcsState.kind), { deliverAs: "followUp" });
+		const repoText = dirtyStates.length === 1 ? dirtyStates[0]!.label : `${dirtyStates.length} repos`;
+		ctx.ui.notify(`VCS changes remain in ${repoText}; reminding agent to commit.`, "info");
+		pi.sendUserMessage(commitReminderPromptForStates(dirtyStates), { deliverAs: "followUp" });
 		return true;
 	}
 
-	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false, afterCleanReview?: (report: ReviewReport) => Promise<void>): Promise<ReviewReport | undefined> {
+	async function runReview(ctx: ExtensionContext, mode: ReviewMode, reviewers: ReviewerName[], extra: string, steer: boolean, targetRev?: string, force = false, afterCleanReview?: (report: ReviewReport) => Promise<void>, bundleOverride?: ReviewBundle): Promise<ReviewReport | undefined> {
 		if (currentJob) {
 			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
 			return undefined;
@@ -1794,7 +2046,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		}
 		let bundle: ReviewBundle;
 		try {
-			bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal, targetRev);
+			bundle = bundleOverride ?? await buildReviewBundle(pi, ctx.cwd, ctx.signal, targetRev);
 		} catch (error) {
 			const target = targetRev ? ` for ${targetRev}` : "";
 			ctx.ui.notify(`Final review could not build review target${target}: ${friendlyErrorMessage(error)}`, "error");
@@ -1901,7 +2153,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	async function runFinalChecksForBundle(ctx: ExtensionContext, bundle: ReviewBundle, checksConfig: FinalChecksConfig, source: "auto" | "manual", options: { changedPaths?: string[]; commands?: FinalCheckCommand[] } = {}): Promise<FinalCheckReport | undefined> {
+	async function runFinalChecksForBundle(ctx: ExtensionContext, bundle: ReviewBundle, checksConfig: FinalChecksConfig, source: "auto" | "manual", options: { changedPaths?: string[]; changedChildProjectPaths?: string[]; commands?: FinalCheckCommand[] } = {}): Promise<FinalCheckReport | undefined> {
 		if (currentJob) {
 			ctx.ui.notify(`Final review #${currentJob.id} is already running. Use /final-review status or /final-review cancel.`, "warning");
 			return undefined;
@@ -1914,7 +2166,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			if (source === "manual") ctx.ui.notify(`Final checks are disabled in ${CONFIG_PATH}. Use /final-review checks on after adding commands.`, "info");
 			return undefined;
 		}
-		const commands = options.commands ?? await resolveFinalCheckCommands(ctx.cwd, checksConfig, source, options.changedPaths ?? []);
+		const commands = options.commands ?? await resolveFinalCheckCommands(ctx.cwd, checksConfig, source, options.changedPaths ?? [], options.changedChildProjectPaths ?? []);
 		if (commands.length === 0) {
 			if (source === "manual") ctx.ui.notify(`No final check commands are configured in ${CONFIG_PATH}.`, "warning");
 			return undefined;
@@ -2031,24 +2283,24 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		const shouldRunChecks = finalChecksConfigured(config.finalChecks);
 		if (!config.autoReview && !shouldRunChecks) return;
 
-		const changedPaths = await getChangedPaths(pi, ctx.cwd, ctx.signal).catch(() => []);
-		const autoTarget: AutoReviewTarget | undefined = changedPaths.length > 0
-			? { reason: "working-copy", changedPaths, description: "working-copy changes" }
-			: await getRecentCommitAutoReviewTarget(pi, ctx.cwd, ctx.signal).catch(() => undefined);
-		if (!autoTarget) return;
-
-		const bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal, autoTarget.targetRev).catch((error) => {
-			ctx.ui.notify(`Final review auto-run skipped: could not build review target: ${friendlyErrorMessage(error)}`, "warning");
+		const finalization = await buildFinalizationSnapshot(pi, ctx.cwd, config, ctx.signal).catch((error) => {
+			ctx.ui.notify(`Final review auto-run skipped: could not build finalization snapshot: ${friendlyErrorMessage(error)}`, "warning");
 			return undefined;
 		});
-		if (!bundle) return;
-		const diffHash = reviewBundleHash(bundle);
+		if (!finalization || finalization.activeRepos.length === 0) return;
+
+		const bundle = finalization.bundle;
+		const diffHash = finalization.hash;
+		const aggregateUnchanged = unchangedSinceTurnStart(diffHash);
 		if (!await shouldProceedForUnchangedTurn(ctx, config, bundle, diffHash)) return;
-		const docsOnly = allDocumentationPaths(autoTarget.changedPaths);
+		const turnActiveRepos = aggregateUnchanged ? finalization.activeRepos : activeReposChangedSinceSnapshot(finalization, turnStartSnapshot);
+		const turnChangedPaths = changedPathsForRepos(turnActiveRepos);
+		const turnChangedChildProjectPaths = changedChildProjectPathsForRepos(turnActiveRepos);
+		const docsOnly = allDocumentationPaths(turnChangedPaths.length > 0 ? turnChangedPaths : finalization.changedPaths);
 		let finalChecksPassedForDiff = !shouldRunChecks;
 
 		if (shouldRunChecks) {
-			const commands = await resolveFinalCheckCommands(ctx.cwd, config.finalChecks, "auto", autoTarget.changedPaths).catch((error) => {
+			const commands = await resolveFinalCheckCommands(ctx.cwd, config.finalChecks, "auto", turnChangedPaths, turnChangedChildProjectPaths).catch((error) => {
 				ctx.ui.notify(`Final checks auto-run skipped: failed to resolve child project checks: ${friendlyErrorMessage(error)}`, "warning");
 				return undefined;
 			});
@@ -2062,7 +2314,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				} else if (autoCheckAttemptedDiffs.has(checkKey)) return;
 				else {
 					rememberDiffHash(autoCheckAttemptedDiffs, checkKey);
-					const checkReport = await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "auto", { changedPaths: autoTarget.changedPaths, commands }).catch((error) => {
+					const checkReport = await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "auto", { changedPaths: turnChangedPaths, changedChildProjectPaths: turnChangedChildProjectPaths, commands }).catch((error) => {
 						ctx.ui.notify(`Final checks auto-run failed: ${friendlyErrorMessage(error)}`, "warning");
 						return undefined;
 					});
@@ -2072,7 +2324,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		const remindToCommit = () => maybeSendCommitReminder(ctx, config, autoTarget, bundle, diffHash, { checksPassed: finalChecksPassedForDiff });
+		const remindToCommit = () => maybeSendCommitReminder(ctx, config, finalization, diffHash, { checksPassed: finalChecksPassedForDiff });
 		if (!config.autoReview) {
 			await remindToCommit();
 			return;
@@ -2088,10 +2340,11 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 		if (docsOnly && config.docsOnlyReview === "ask") {
 			if (!ctx.hasUI) return;
-			const preview = autoTarget.changedPaths.slice(0, 8).join("\n");
-			const suffix = autoTarget.changedPaths.length > 8 ? `\n... +${autoTarget.changedPaths.length - 8} more` : "";
+			const previewPaths = turnChangedPaths.length > 0 ? turnChangedPaths : finalization.changedPaths;
+			const preview = previewPaths.slice(0, 8).join("\n");
+			const suffix = previewPaths.length > 8 ? `\n... +${previewPaths.length - 8} more` : "";
 			const prompt = finalChecksPassedForDiff ? "Final checks passed. Run final review now?" : "Run final review now?";
-			const ok = await ctx.ui.confirm("Review documentation-only changes?", `${autoTarget.description}:\n\n${preview}${suffix}\n\n${prompt}`);
+			const ok = await ctx.ui.confirm("Review documentation-only changes?", `${finalization.description}:\n\n${preview}${suffix}\n\n${prompt}`);
 			rememberDiffHash(autoAttemptedDiffs, diffHash);
 			if (!ok) {
 				await remindToCommit();
@@ -2101,9 +2354,9 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			rememberDiffHash(autoAttemptedDiffs, diffHash);
 		}
 
-		await runReview(ctx, config.defaultMode, config.reviewers, `Automatic review after ${autoTarget.description}.`, shouldAutoReviewSteer(config), autoTarget.targetRev, false, async () => {
+		await runReview(ctx, config.defaultMode, config.reviewers, `Automatic review after ${finalization.description}.`, shouldAutoReviewSteer(config), undefined, false, async () => {
 			await remindToCommit();
-		}).catch((error) => {
+		}, bundle).catch((error) => {
 			ctx.ui.notify(`Final review auto-run failed: ${friendlyErrorMessage(error)}`, "warning");
 		});
 	}
@@ -2127,7 +2380,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		turnStartSnapshot = undefined;
 		const config = await loadConfig(ctx.cwd).catch(() => undefined);
 		if (!config || !autoFinalizationConfigured(config)) return;
-		turnStartSnapshot = await captureTurnStartSnapshot(ctx).catch(() => undefined);
+		turnStartSnapshot = await captureTurnStartSnapshot(ctx, config).catch(() => undefined);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -2178,7 +2431,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Final review config (${CONFIG_PATH} optional):\n` +
 					JSON.stringify(config, null, 2) +
-					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks. commitReminder.enabled=true sends a jj commit reminder after successful checks/clean review, but only when this turn changed the target. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
+					`\n\nCommand examples:\n/final-review enable\n/final-review auto on\n/final-review auto off\n/final-review checks\n/final-review checks on\n/final-review checks off\n/final-review both\n/final-review blocking both\n/final-review codex rev @-\n/final-review background glm --target abc123 steer\n/final-review force both\n/final-review send [latest|#id]\n/final-review note focus parser edge cases\n\nModel overrides: codexModel or PI_FINAL_REVIEW_CODEX_MODEL for openai-codex, glmModel or PI_FINAL_REVIEW_MODEL for ZAI.\nTimeouts: timeoutMs, finalChecks.timeoutMs, PI_FINAL_REVIEW_TIMEOUT_MS, and PI_FINAL_REVIEW_CHECK_TIMEOUT_MS are capped at ${MAX_TIMEOUT_MS}ms.\n\nAuto-review: /final-review enable writes ${CONFIG_PATH} with enabled=true and autoReview=true for this project. Auto-review runs after working-copy changes, or after a clean working copy if the previous jj commit / git HEAD was committed in the last ${Math.round(RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS / 1000)}s. docsOnlyReview=ask|auto|skip controls documentation-only review.\n\nFinal checks: set finalChecks.enabled=true and finalChecks.commands=[\"npm run typecheck\", {\"name\":\"build\",\"command\":\"npm run build\"}] to run project commands after agent turns. Meta workspaces can set finalChecks.childProjects={enabled:true, projects:[{path:\"agent-tick\"}], defaults:{commandWrapper:\"devbox run -- bash -lc {command:q}\"}} to aggregate child repo checks; automatic finalization snapshots include configured/discovered child repos so child-only changes can trigger checks. commitReminder.enabled=true sends a jj/git commit reminder after successful checks/clean review, but only when this turn changed the aggregate target. Failing checks are sent back to the agent as a follow-up and automatic review is deferred until checks pass. sendFollowUp only forwards actionable review results; /final-review send forwards any completed review report on demand.`,
 				"info",
 			);
 			return;
@@ -2213,12 +2466,12 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`Final review is disabled by ${CONFIG_PATH}.`, "info");
 				return;
 			}
-			const bundle = await buildReviewBundle(pi, ctx.cwd, ctx.signal).catch((error) => {
-				ctx.ui.notify(`Final checks could not build review target: ${friendlyErrorMessage(error)}`, "error");
+			const finalization = await buildFinalizationSnapshot(pi, ctx.cwd, config, ctx.signal).catch((error) => {
+				ctx.ui.notify(`Final checks could not build finalization target: ${friendlyErrorMessage(error)}`, "error");
 				return undefined;
 			});
-			if (!bundle) return;
-			await runFinalChecksForBundle(ctx, bundle, config.finalChecks, "manual").catch((error) => {
+			if (!finalization) return;
+			await runFinalChecksForBundle(ctx, finalization.bundle, config.finalChecks, "manual", { changedPaths: finalization.changedPaths, changedChildProjectPaths: finalization.changedChildProjectPaths }).catch((error) => {
 				ctx.ui.notify(`Final checks failed: ${friendlyErrorMessage(error)}`, "error");
 			});
 			return;
@@ -2346,7 +2599,10 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 export const __test__ = {
 	allDocumentationPaths,
+	activeReposChangedSinceSnapshot,
 	baseReviewPrompt,
+	changedChildProjectPathsForRepos,
+	changedPathsForRepos,
 	DEFAULT_TIMEOUT_MS,
 	finalReportMessage,
 	finalReportFollowUpMessage,
@@ -2360,8 +2616,11 @@ export const __test__ = {
 	hashText,
 	isDocumentationPath,
 	parseArgs,
+	buildFinalizationSnapshot,
 	commitReminderPrompt,
+	commitReminderPromptForStates,
 	commitReminderVcsState,
+	collectCommitReminderStates,
 	parseChangedPaths,
 	parseCommitReminderConfig,
 	parseReportReference,
@@ -2374,6 +2633,7 @@ export const __test__ = {
 	MAX_TIMEOUT_MS,
 	RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS,
 	parseGitStatusPaths,
+	parseGitUntrackedPaths,
 	applyCommandWrapper,
 	discoverChildProjects,
 	parseFinalCheckChildProjectsConfig,

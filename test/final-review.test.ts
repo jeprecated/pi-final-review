@@ -254,7 +254,68 @@ test("child project final checks can filter to changed children", async () => {
 		});
 		const commands = await finalReview.resolveFinalCheckCommands(cwd, checks, "auto", ["repo-b/src/index.ts"]);
 		assert.deepEqual(commands.map((command) => command.name), ["repo-b: npm run typecheck"]);
+
+		const snapshotCommands = await finalReview.resolveFinalCheckCommands(cwd, checks, "auto", [], ["repo-a"]);
+		assert.deepEqual(snapshotCommands.map((command) => command.name), ["repo-a: npm run typecheck"]);
 	});
+});
+
+test("finalization snapshots include child repo changes", async () => {
+	await withTempDir(async (cwd) => {
+		const child = join(cwd, "repo");
+		await mkdir(child, { recursive: true });
+		const checks = finalReview.parseFinalChecksConfig({
+			enabled: true,
+			childProjects: {
+				projects: ["repo"],
+			},
+		});
+		const loaded = { ...config, finalChecks: checks };
+		let childDiff = "diff --git a/src/index.ts b/src/index.ts\n+change one\n";
+		const pi = {
+			exec: async (command: string, args: string[], options: { cwd?: string }) => {
+				const key = [command, ...args].join(" ");
+				const execCwd = options.cwd;
+				if (key === "jj root") return { code: 1, stdout: "", stderr: "not jj" };
+				if (key === "git rev-parse --show-toplevel") return { code: 0, stdout: `${execCwd}\n`, stderr: "" };
+				if (execCwd === cwd) {
+					if (key === "git status --short") return { code: 0, stdout: "", stderr: "" };
+					if (key === "git rev-parse HEAD") return { code: 0, stdout: "root-head\n", stderr: "" };
+					if (key === "git log -1 --format=%cI") return { code: 1, stdout: "", stderr: "no recent commit" };
+				}
+				if (execCwd === child) {
+					if (key === "git status --short") return { code: 0, stdout: " M src/index.ts\n", stderr: "" };
+					if (key === "git diff --no-ext-diff") return { code: 0, stdout: childDiff, stderr: "" };
+					if (key === "git diff --cached --no-ext-diff") return { code: 0, stdout: "", stderr: "" };
+					if (key === "git diff --stat") return { code: 0, stdout: " src/index.ts | 1 +\n", stderr: "" };
+					if (key === "git diff --cached --stat") return { code: 0, stdout: "", stderr: "" };
+				}
+				return { code: 1, stdout: "", stderr: `unexpected command: ${key} in ${execCwd}` };
+			},
+		} as unknown as Parameters<typeof finalReview.buildFinalizationSnapshot>[0];
+
+		const first = await finalReview.buildFinalizationSnapshot(pi, cwd, loaded);
+		assert.deepEqual(first.activeRepos.map((repo) => repo.label), ["repo"]);
+		assert.deepEqual(first.changedChildProjectPaths, ["repo"]);
+		assert.deepEqual(first.changedPaths, ["repo/src/index.ts"]);
+		assert.match(first.bundle.text, /## repo/);
+
+		childDiff = "diff --git a/src/index.ts b/src/index.ts\n+change two\n";
+		const second = await finalReview.buildFinalizationSnapshot(pi, cwd, loaded);
+		assert.notEqual(first.hash, second.hash);
+	});
+});
+
+test("finalization changed child paths use per-repo snapshot changes", () => {
+	const baseRepo = { cwd: "/workspace", isRoot: false, vcs: "git" as const, vcsRoot: "/workspace/repo", dirty: true };
+	const unchangedChild = { ...baseRepo, key: "repo-a", label: "repo-a", projectPath: "repo-a", fingerprint: "dirty-a", activity: { reason: "working-copy" as const, changedPaths: ["src/a.ts"], description: "git working tree and index changes" } };
+	const changedChild = { ...baseRepo, key: "repo-b", label: "repo-b", projectPath: "repo-b", fingerprint: "dirty-b-2", activity: { reason: "working-copy" as const, changedPaths: ["src/b.ts"], description: "git working tree and index changes" } };
+	const start = { hash: "start", target: "start", description: "start", bundle: { target: "start", fingerprint: "start", text: "" }, repos: [{ ...unchangedChild }, { ...changedChild, fingerprint: "dirty-b-1" }], activeRepos: [], changedPaths: [], changedChildProjectPaths: [] };
+	const end = { hash: "end", target: "end", description: "end", bundle: { target: "end", fingerprint: "end", text: "" }, repos: [unchangedChild, changedChild], activeRepos: [unchangedChild, changedChild], changedPaths: [], changedChildProjectPaths: [] };
+	const changedRepos = finalReview.activeReposChangedSinceSnapshot(end, start);
+	assert.deepEqual(changedRepos.map((repo) => repo.key), ["repo-b"]);
+	assert.deepEqual(finalReview.changedChildProjectPathsForRepos(changedRepos), ["repo-b"]);
+	assert.deepEqual(finalReview.changedPathsForRepos(changedRepos), ["repo-b/src/b.ts"]);
 });
 
 test("child project final checks can discover nested final-review configs", async () => {
@@ -281,6 +342,10 @@ test("commit reminder prompts support jj and git", () => {
 	assert.match(finalReview.commitReminderPrompt("jj"), /jj commit -m/);
 	assert.match(finalReview.commitReminderPrompt("git"), /git status --short/);
 	assert.match(finalReview.commitReminderPrompt("git"), /git add -A && git commit -m/);
+	assert.match(finalReview.commitReminderPromptForStates([
+		{ kind: "jj", root: "/repo-a", hasChanges: true, summary: "M a.ts", key: "repo-a", label: "repo-a", cwd: "/repo-a" },
+		{ kind: "git", root: "/repo-b", hasChanges: true, summary: " M b.ts", key: "repo-b", label: "repo-b", cwd: "/repo-b" },
+	]), /repo-a[\s\S]*jj status --no-pager[\s\S]*repo-b[\s\S]*git status --short/);
 });
 
 test("commit reminder VCS detection prefers jj and falls back to git", async () => {

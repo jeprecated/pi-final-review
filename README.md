@@ -128,7 +128,7 @@ Command entries can be strings or objects with:
 
 ### Child project checks
 
-Meta workspaces can run checks from nested repos by adding `finalChecks.childProjects`. Each child keeps its own `.pi/final-review.json`; the meta workspace reads the child's `finalChecks.commands`, runs them from that child path, and reports failures in one combined final-check report.
+Meta workspaces can run checks from nested repos by adding `finalChecks.childProjects`. Each child keeps its own `.pi/final-review.json`; the meta workspace reads the child's `finalChecks.commands`, runs them from that child path, and reports failures in one combined final-check report. Automatic finalization snapshots include the root plus configured/discovered child repos, so child-only jj/git changes can trigger checks even when the parent workspace has no diff.
 
 ```json
 {
@@ -156,7 +156,7 @@ Meta workspaces can run checks from nested repos by adding `finalChecks.childPro
 `run` controls automatic checks:
 
 - `all` — run every configured/discovered child project.
-- `changed` — run only child projects touched by the current diff.
+- `changed` — run only child projects whose own child repo snapshot changed, or that are touched by parent changed paths.
 - `manual` — only run child project checks via `/final-review checks`.
 
 `commandWrapper` is applied only to child commands. Use `{command}` for raw substitution or `{command:q}` for shell-quoted substitution. If no placeholder is present, the original command is appended, so `"devbox run --"` becomes `devbox run -- npm run typecheck`.
@@ -186,7 +186,7 @@ The extension creates read-only SDK sub-agent sessions for review. Reviewer avai
 
 ## Auto-review
 
-When `autoReview` or `finalChecks` automation is enabled, the extension snapshots the review target at agent turn start. If the target is unchanged at turn end, `unchangedTurnReview` controls what happens:
+When `autoReview` or `finalChecks` automation is enabled, the extension snapshots an aggregate finalization target at agent turn start. The aggregate includes the root repo and each configured/discovered child repo. Each repo snapshot prefers jj (`jj root`) and falls back to git (`git rev-parse --show-toplevel`). If the aggregate target is unchanged at turn end, `unchangedTurnReview` controls what happens:
 
 - `ask` — offer a yes/no prompt to run checks/review anyway (default).
 - `skip` — silently skip automatic checks/review.
@@ -194,7 +194,7 @@ When `autoReview` or `finalChecks` automation is enabled, the extension snapshot
 
 This prevents a fresh session from running checks just because the repo was already dirty, while still letting you opt in from the prompt. Set `requireTurnChanges=false` to restore the old always-run behavior.
 
-`commitReminder.enabled=true` adds a commit reminder step only after configured checks have passed (and after clean automatic review, when review is enabled). If checks fail, the agent gets the failing check output instead. If checks pass and VCS changes remain, the agent gets a commit reminder. If checks pass and there is nothing to commit, nothing is sent. The reminder is gated to turns that changed the target.
+`commitReminder.enabled=true` adds a commit reminder step only after configured checks have passed (and after clean automatic review, when review is enabled). If checks fail, the agent gets the failing check output instead. If checks pass and VCS changes remain, the agent gets a commit reminder. If checks pass and there is nothing to commit, nothing is sent. The reminder is gated to turns that changed the aggregate target.
 
 Commit reminders prefer jj when a jj repo is detected (`.jj` / `jj root`), and fall back to git when only git is detected (`.git` / `git rev-parse --show-toplevel`). The follow-up uses the matching commands (`jj status --no-pager` / `jj diff --summary --no-pager` / `jj commit`, or `git status --short` / `git diff --stat` / `git add -A && git commit`).
 
@@ -204,20 +204,22 @@ Automatic finalization flow:
 agent_start
   |
   v
-snapshot review-target hash
+snapshot aggregate hash
+  (root + configured/discovered children)
   |
   v
 agent_end
   |
   v
-same target as snapshot?
+same aggregate target as snapshot?
   |-- yes --> unchangedTurnReview
   |             |-- ask --> user chooses yes/no
   |             |-- skip --> stop
   |             '-- run --> continue
   |
   v
-resolve finalChecks commands (root + child projects)
+resolve finalChecks commands
+  (root + child projects; run=changed uses child hashes)
   |
   v
 commands configured?
@@ -237,17 +239,20 @@ autoReview enabled?
   '-- no --------------------------'
                        |
                        v
-commitReminder enabled and this turn changed the target?
+commitReminder enabled and this turn changed the aggregate target?
   |-- no --> stop
   |
   v
-VCS dirty?
-  |-- jj dirty  --> send jj commit reminder
-  |-- git dirty --> send git commit reminder
-  '-- clean ----> stop
+any root/child repo dirty?
+  |-- jj dirty  --> include repo in jj reminder
+  |-- git dirty --> include repo in git reminder
+  '-- all clean -> stop
+  |
+  v
+send one combined commit reminder
 ```
 
-When `autoReview` is enabled, the extension checks for changes after agent turns and can run a review automatically. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
+When `autoReview` is enabled, the extension checks for aggregate root/child changes after agent turns and can run a review automatically. If child repos are active, their change bundles are included in the review input. If `finalChecks.enabled` has commands configured, those checks run first and must pass before automatic review starts. Documentation-only changes are controlled by:
 
 ```json
 {
