@@ -150,13 +150,14 @@ test("escape input detection supports interactive cancellation", () => {
 	assert.equal(finalReview.isEscapeInput("a"), false);
 });
 
-test("agent cancellation suppresses automatic finalization", () => {
-	assert.equal(finalReview.agentEndWasAborted({ messages: [{ role: "assistant", stopReason: "aborted" }] }), true);
-	assert.equal(finalReview.agentEndWasAborted({ messages: [{ role: "assistant", stopReason: "stop" }] }), false);
+test("agent interruption and errors suppress automatic finalization", () => {
+	assert.equal(finalReview.agentEndShouldSkipFinalization({ messages: [{ role: "assistant", stopReason: "aborted" }] }), true);
+	assert.equal(finalReview.agentEndShouldSkipFinalization({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "WebSocket error" }] }), true);
+	assert.equal(finalReview.agentEndShouldSkipFinalization({ messages: [{ role: "assistant", stopReason: "stop" }] }), false);
 
 	const controller = new AbortController();
 	controller.abort();
-	assert.equal(finalReview.agentEndWasAborted({ messages: [] }, controller.signal), true);
+	assert.equal(finalReview.agentEndShouldSkipFinalization({ messages: [] }, controller.signal), true);
 });
 
 test("duration formatting uses minutes for long reviews", () => {
@@ -371,6 +372,43 @@ test("tool mutation classification distinguishes read-only queries from writes/s
 	assert.equal(finalReview.classifyToolForFinalization("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.write", parameters: { path: "x", content: "y" } }] }).mutating, true);
 });
 
+test("commit reminder session toggle controls effective status", () => {
+	assert.equal(finalReview.commitReminderEffectiveEnabled(config, true), true);
+	assert.equal(finalReview.commitReminderEffectiveEnabled(config, false), false);
+	assert.equal(finalReview.commitReminderStatusText(config, true, "alt+m"), "commit:on alt+m");
+	assert.equal(finalReview.commitReminderStatusText(config, false, "alt+m"), "commit:off alt+m");
+	assert.equal(finalReview.commitReminderStatusText({ ...config, enabled: false }, true, "alt+m"), "commit:disabled alt+m");
+	assert.equal(finalReview.commitReminderStatusText({ ...config, commitReminder: { enabled: false } }, true, "alt+m"), "commit:cfg-off alt+m");
+});
+
+test("user follow-ups created during agent_end defer until the session is idle", () => {
+	let idle = false;
+	let deferred: (() => void) | undefined;
+	const sent: { content: string; options?: { deliverAs?: "steer" | "followUp" } }[] = [];
+	const ctx = { isIdle: () => idle };
+	const result = finalReview.sendUserMessageAfterCurrentTurn(ctx, (content, options) => sent.push({ content, options }), "commit reminder", (callback) => {
+		deferred = callback;
+	});
+
+	assert.equal(result, "deferred");
+	assert.deepEqual(sent, []);
+	idle = true;
+	deferred?.();
+	assert.deepEqual(sent, [{ content: "commit reminder", options: undefined }]);
+});
+
+test("user follow-ups still queue as follow-up if another turn starts before deferred send", () => {
+	let deferred: (() => void) | undefined;
+	const sent: { content: string; options?: { deliverAs?: "steer" | "followUp" } }[] = [];
+	const ctx = { isIdle: () => false };
+	finalReview.sendUserMessageAfterCurrentTurn(ctx, (content, options) => sent.push({ content, options }), "check failure", (callback) => {
+		deferred = callback;
+	});
+
+	deferred?.();
+	assert.deepEqual(sent, [{ content: "check failure", options: { deliverAs: "followUp" } }]);
+});
+
 test("commit reminder prompts support jj and git", () => {
 	assert.match(finalReview.commitReminderPrompt("jj"), /jj status --no-pager/);
 	assert.match(finalReview.commitReminderPrompt("jj"), /jj commit -m/);
@@ -445,6 +483,25 @@ test("final report message is built for single-reviewer reports", () => {
 	const cancelled: typeof report = { ...report, results: [{ reviewer: "codex", outcome: "cancelled", durationMs: 100, output: "cancelled" }] };
 	assert.equal(finalReview.shouldSendFollowUp(cancelled, true), false);
 	assert.equal(finalReview.reportNeedsAttention(cancelled), true);
+});
+
+test("cancelled final checks do not send follow-ups", () => {
+	const report: Parameters<typeof finalReview.formatFinalCheckReport>[0] = {
+		id: 34,
+		startedAt: 0,
+		finishedAt: 100,
+		target: "working copy changes (@ vs @-)",
+		diffHash: "abc123",
+		commands: [{ name: "typecheck", command: "npm run typecheck" }],
+		results: [{ name: "typecheck", command: "npm run typecheck", outcome: "cancelled", durationMs: 100, output: "cancelled", error: "cancelled" }],
+	};
+	assert.equal(finalReview.finalCheckReportCancelled(report), true);
+	assert.equal(finalReview.shouldSendFinalCheckFollowUp(report, config.finalChecks), false);
+
+	const failed: typeof report = { ...report, results: [{ name: "typecheck", command: "npm run typecheck", outcome: "failed", durationMs: 100, output: "failed" }] };
+	assert.equal(finalReview.finalCheckReportCancelled(failed), false);
+	assert.equal(finalReview.shouldSendFinalCheckFollowUp(failed, config.finalChecks), true);
+	assert.equal(finalReview.shouldSendFinalCheckFollowUp(failed, config.finalChecks, { suppressFollowUp: true }), false);
 });
 
 test("follow-up detection handles structured verdicts and qualified clean phrases", () => {

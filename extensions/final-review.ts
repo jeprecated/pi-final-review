@@ -11,7 +11,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, matchesKey, Text } from "@earendil-works/pi-tui";
 
 type ReviewMode = "background" | "blocking";
 type ReviewCommandAction = "run" | "status" | "cancel" | "config" | "send" | "note" | "enable" | "disable" | "auto-on" | "auto-off" | "checks" | "checks-on" | "checks-off";
@@ -264,6 +264,8 @@ const MESSAGE_TYPE = "final-review-report";
 const REVIEWED_DIFF_ENTRY_TYPE = "final-review-reviewed-diff";
 const CHECKED_DIFF_ENTRY_TYPE = "final-review-checked-diff";
 const STATUS_KEY = "final-review";
+const COMMIT_REMINDER_STATUS_KEY = "final-review-commit-reminder";
+const COMMIT_REMINDER_TOGGLE_SHORTCUT = "alt+m";
 const CONFIG_PATH = path.join(".pi", "final-review.json");
 const DEFAULT_TIMEOUT_MS = 600_000;
 const LIVE_SNIPPET_CHARS = 600;
@@ -1240,6 +1242,31 @@ function finalChecksCommandsHash(commands: FinalCheckCommand[], defaultTimeoutMs
 	return hashText(JSON.stringify(commands.map((command) => ({ name: command.name, command: command.command, cwd: command.cwd, timeoutMs: command.timeoutMs ?? defaultTimeoutMs }))));
 }
 
+function commitReminderEffectiveEnabled(config: Pick<FinalReviewConfig, "enabled" | "commitReminder">, sessionEnabled: boolean): boolean {
+	return config.enabled && config.commitReminder.enabled && sessionEnabled;
+}
+
+function commitReminderStatusText(config: Pick<FinalReviewConfig, "enabled" | "commitReminder">, sessionEnabled: boolean, shortcut = COMMIT_REMINDER_TOGGLE_SHORTCUT): string {
+	const suffix = ` ${shortcut}`;
+	if (!config.enabled) return `commit:disabled${suffix}`;
+	if (!config.commitReminder.enabled) return `commit:cfg-off${suffix}`;
+	return `commit:${sessionEnabled ? "on" : "off"}${suffix}`;
+}
+
+type DeferredUserMessageContext = Pick<ExtensionContext, "isIdle">;
+type UserMessageSender = (content: string, options?: { deliverAs?: "steer" | "followUp" }) => void;
+type DeferCallback = (callback: () => void, delayMs: number) => unknown;
+
+function sendUserMessageAfterCurrentTurn(ctx: DeferredUserMessageContext, sendUserMessage: UserMessageSender, content: string, defer: DeferCallback = setTimeout): "sent" | "deferred" {
+	const send = () => sendUserMessage(content, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+	if (ctx.isIdle()) {
+		send();
+		return "sent";
+	}
+	defer(send, 0);
+	return "deferred";
+}
+
 function finalCheckRunKey(diffHash: string, commands: FinalCheckCommand[], defaultTimeoutMs = DEFAULT_TIMEOUT_MS): string {
 	return `${diffHash}:${finalChecksCommandsHash(commands, defaultTimeoutMs)}`;
 }
@@ -1579,6 +1606,14 @@ function finalCheckReportNeedsAttention(report: FinalCheckReport): boolean {
 	return !finalCheckReportPassed(report) || report.results.some(finalCheckResultNeedsAttention);
 }
 
+function finalCheckReportCancelled(report: FinalCheckReport): boolean {
+	return report.results.some((result) => result.outcome === "cancelled");
+}
+
+function shouldSendFinalCheckFollowUp(report: FinalCheckReport, checksConfig: FinalChecksConfig, options: { suppressFollowUp?: boolean } = {}): boolean {
+	return checksConfig.sendFollowUp && !options.suppressFollowUp && !finalCheckReportCancelled(report) && finalCheckReportNeedsAttention(report);
+}
+
 function finalCheckDisplayIcon(result: FinalCheckResult): string {
 	return reviewerIcon(result.outcome);
 }
@@ -1852,7 +1887,7 @@ function compactLiveOneLine(text: string, maxChars = WIDGET_SNIPPET_CHARS): stri
 }
 
 function isEscapeInput(data: string): boolean {
-	return data === "\x1b";
+	return matchesKey(data, "escape");
 }
 
 function indentLines(text: string, prefix = "  "): string {
@@ -1981,10 +2016,10 @@ function looksLikeImplicitTarget(token: string): boolean {
 	return token === "@" || /^@[+-]+$/.test(token) || token.includes("::");
 }
 
-function agentEndWasAborted(event: { messages?: unknown }, signal?: AbortSignal): boolean {
+function agentEndShouldSkipFinalization(event: { messages?: unknown }, signal?: AbortSignal): boolean {
 	if (signal?.aborted) return true;
 	const messages = Array.isArray(event.messages) ? event.messages : [];
-	return messages.some((message) => isRecord(message) && message.role === "assistant" && message.stopReason === "aborted");
+	return messages.some((message) => isRecord(message) && message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error"));
 }
 
 function parseArgs(args: string, config: FinalReviewConfig): ParsedFinalReviewArgs {
@@ -2052,6 +2087,8 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	const commitReminderDiffs = new Set<string>();
 	let turnStartSnapshot: TurnStartSnapshot | undefined;
 	let agentToolActivity: AgentToolActivity | undefined;
+	let finalizationInterruptUnsubscribe: (() => void) | undefined;
+	let commitReminderEnabledForSession = true;
 
 	function setStatus(ctx: ExtensionContext) {
 		if (currentJob) {
@@ -2074,17 +2111,55 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function sendReport(report: ReviewReport, steer: boolean): boolean {
+	async function updateCommitReminderStatus(ctx: ExtensionContext, config?: FinalReviewConfig) {
+		const loaded = config ?? await loadConfig(ctx.cwd).catch(() => undefined);
+		if (!loaded) {
+			ctx.ui.setStatus(COMMIT_REMINDER_STATUS_KEY, `commit:? ${COMMIT_REMINDER_TOGGLE_SHORTCUT}`);
+			return;
+		}
+		ctx.ui.setStatus(COMMIT_REMINDER_STATUS_KEY, commitReminderStatusText(loaded, commitReminderEnabledForSession));
+	}
+
+	function cancelRunningFinalization(ctx: ExtensionContext, source: string): boolean {
+		if (currentJob) {
+			const id = currentJob.id;
+			if (!currentJob.controller.signal.aborted) {
+				currentJob.controller.abort();
+				ctx.ui.notify(`Cancelling final review #${id} (${source}).`, "warning");
+			}
+			setStatus(ctx);
+			return true;
+		}
+		if (currentCheckJob) {
+			const id = currentCheckJob.id;
+			if (!currentCheckJob.controller.signal.aborted) {
+				currentCheckJob.controller.abort();
+				ctx.ui.notify(`Cancelling final checks #${id} (${source}).`, "warning");
+			}
+			setStatus(ctx);
+			return true;
+		}
+		return false;
+	}
+
+	function installFinalizationInterrupt(ctx: ExtensionContext) {
+		finalizationInterruptUnsubscribe?.();
+		finalizationInterruptUnsubscribe = ctx.ui.onTerminalInput((data) => {
+			if (!isEscapeInput(data)) return undefined;
+			return cancelRunningFinalization(ctx, "Escape") ? { consume: true } : undefined;
+		});
+	}
+
+	function sendReport(ctx: ExtensionContext, report: ReviewReport, steer: boolean): boolean {
 		const sendFollowUp = shouldSendFollowUp(report, steer);
 		pi.sendMessage(finalReportMessage(report, { sendHint: !sendFollowUp }), { triggerTurn: false });
 		if (sendFollowUp) {
-			pi.sendUserMessage(finalReportFollowUpMessage(report), { deliverAs: "followUp" });
+			sendUserMessageAfterCurrentTurn(ctx, pi.sendUserMessage, finalReportFollowUpMessage(report));
 		}
 		return sendFollowUp;
 	}
 
-	function sendFinalCheckReport(report: FinalCheckReport, checksConfig: FinalChecksConfig): boolean {
-		const needsAttention = finalCheckReportNeedsAttention(report);
+	function sendFinalCheckReport(ctx: ExtensionContext, report: FinalCheckReport, checksConfig: FinalChecksConfig, options: { suppressFollowUp?: boolean } = {}): boolean {
 		pi.sendMessage(
 			{
 				customType: MESSAGE_TYPE,
@@ -2094,8 +2169,8 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			},
 			{ triggerTurn: false },
 		);
-		if (needsAttention && checksConfig.sendFollowUp) {
-			pi.sendUserMessage(finalChecksFollowUpMessage(report), { deliverAs: "followUp" });
+		if (shouldSendFinalCheckFollowUp(report, checksConfig, options)) {
+			sendUserMessageAfterCurrentTurn(ctx, pi.sendUserMessage, finalChecksFollowUpMessage(report));
 			return true;
 		}
 		return false;
@@ -2161,7 +2236,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	}
 
 	async function maybeSendCommitReminder(ctx: ExtensionContext, config: FinalReviewConfig, finalization: FinalizationSnapshot, diffHash: string, options: { checksPassed: boolean }): Promise<boolean> {
-		if (!config.commitReminder.enabled) return false;
+		if (!commitReminderEffectiveEnabled(config, commitReminderEnabledForSession)) return false;
 		if (finalChecksConfigured(config.finalChecks) && !options.checksPassed) return false;
 		if (!turnStartSnapshot || unchangedSinceTurnStart(diffHash)) return false;
 		if (hasPendingMessages(ctx)) return false;
@@ -2179,7 +2254,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		rememberDiffHash(commitReminderDiffs, reminderKey);
 		const repoText = dirtyStates.length === 1 ? dirtyStates[0]!.label : `${dirtyStates.length} repos`;
 		ctx.ui.notify(`VCS changes remain in ${repoText}; reminding agent to commit.`, "info");
-		pi.sendUserMessage(commitReminderPromptForStates(dirtyStates), { deliverAs: "followUp" });
+		sendUserMessageAfterCurrentTurn(ctx, pi.sendUserMessage, commitReminderPromptForStates(dirtyStates));
 		return true;
 	}
 
@@ -2275,13 +2350,6 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		currentJob.promise = promise;
 		const ticker = setInterval(() => setStatus(ctx), 1000);
 		ticker.unref();
-		const unsubscribeInterrupt = ctx.ui.onTerminalInput((data) => {
-			if (!isEscapeInput(data) || currentJob?.id !== id || controller.signal.aborted) return undefined;
-			controller.abort();
-			ctx.ui.notify(`Cancelling final review #${id}.`, "warning");
-			setStatus(ctx);
-			return { consume: true };
-		});
 		setStatus(ctx);
 		if (mode === "background") ctx.ui.notify(`Started final review #${id} (${mode}; ${reviewers.join(", ")}; target: ${bundle.target}). Press Escape or use /final-review cancel to cancel.`, "info");
 
@@ -2300,7 +2368,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				}
 				rememberMapEntry(completedReports, report.id, report, MAX_COMPLETED_REPORTS);
 				removeLiveJob();
-				const sentFollowUp = sendReport(report, steer);
+				const sentFollowUp = sendReport(ctx, report, steer);
 				const needsAttention = reportNeedsAttention(report);
 				const summary = sentFollowUp ? summarizeReport(report) : `${summarizeReport(report)}. ${finalReportSendHint(report)}`;
 				ctx.ui.notify(summary, needsAttention ? "warning" : "info");
@@ -2308,7 +2376,6 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				return report;
 			} finally {
 				clearInterval(ticker);
-				unsubscribeInterrupt();
 				contextSignal?.removeEventListener("abort", abortFromContext);
 				removeLiveJob();
 				if (currentJob?.id === id) currentJob = undefined;
@@ -2412,13 +2479,6 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		currentCheckJob.promise = promise;
 		const ticker = setInterval(() => setStatus(ctx), 1000);
 		ticker.unref();
-		const unsubscribeInterrupt = ctx.ui.onTerminalInput((data) => {
-			if (!isEscapeInput(data) || currentCheckJob?.id !== id || controller.signal.aborted) return undefined;
-			controller.abort();
-			ctx.ui.notify(`Cancelling final checks #${id}.`, "warning");
-			setStatus(ctx);
-			return { consume: true };
-		});
 		setStatus(ctx);
 		ctx.ui.notify(`Started final checks #${id} (${commands.length} command${commands.length === 1 ? "" : "s"}; target: ${bundle.target}). Press Escape or use /final-review cancel to cancel.`, "info");
 
@@ -2430,18 +2490,18 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 		};
 		try {
 			const report = await promise;
+			const cancelled = controller.signal.aborted || finalCheckReportCancelled(report);
 			if (finalCheckReportPassed(report)) {
 				rememberDiffHash(checkedDiffs, checkKey);
 				pi.appendEntry(CHECKED_DIFF_ENTRY_TYPE, { hash: checkKey, diffHash: report.diffHash, target: report.target, finishedAt: report.finishedAt });
 			}
 			rememberMapEntry(completedCheckReports, report.id, report, MAX_COMPLETED_REPORTS);
 			removeLiveJob();
-			const sentFollowUp = sendFinalCheckReport(report, checksConfig);
+			const sentFollowUp = sendFinalCheckReport(ctx, report, checksConfig, { suppressFollowUp: cancelled });
 			ctx.ui.notify(summarizeFinalCheckReport(report), finalCheckReportNeedsAttention(report) || sentFollowUp ? "warning" : "info");
 			return report;
 		} finally {
 			clearInterval(ticker);
-			unsubscribeInterrupt();
 			contextSignal?.removeEventListener("abort", abortFromContext);
 			removeLiveJob();
 			if (currentCheckJob?.id === id) currentCheckJob = undefined;
@@ -2540,6 +2600,8 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		commitReminderEnabledForSession = true;
+		installFinalizationInterrupt(ctx);
 		const entries = ctx.sessionManager.getEntries();
 		for (const hash of reviewedDiffHashesFromEntries(entries)) rememberDiffHash(reviewedDiffs, hash);
 		for (const hash of checkedDiffHashesFromEntries(entries)) rememberDiffHash(checkedDiffs, hash);
@@ -2552,6 +2614,13 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			nextCheckJobId = Math.max(nextCheckJobId, report.id + 1);
 		}
 		setStatus(ctx);
+		void updateCommitReminderStatus(ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		finalizationInterruptUnsubscribe?.();
+		finalizationInterruptUnsubscribe = undefined;
+		ctx.ui.setStatus(COMMIT_REMINDER_STATUS_KEY, undefined);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -2569,7 +2638,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (event, ctx) => {
 		try {
-			if (agentEndWasAborted(event, ctx.signal)) return;
+			if (agentEndShouldSkipFinalization(event, ctx.signal)) return;
 			await maybeAutoReview(ctx);
 		} finally {
 			turnStartSnapshot = undefined;
@@ -2629,6 +2698,7 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 				const summary = JSON.stringify({ enabled: next.enabled, autoReview: next.autoReview }, null, 2);
 				const verb = parsed.action === "disable" ? "Disabled final review" : parsed.action === "auto-off" ? "Disabled final review auto-review" : "Enabled final review auto-review";
 				ctx.ui.notify(`${verb} for this project in ${CONFIG_PATH}.\n${summary}`, "info");
+				void updateCommitReminderStatus(ctx);
 			} catch (error) {
 				ctx.ui.notify(`Failed to update ${CONFIG_PATH}: ${friendlyErrorMessage(error)}`, "error");
 			}
@@ -2699,6 +2769,16 @@ export default function finalReviewExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`Final review failed: ${friendlyErrorMessage(error)}`, "error");
 		});
 	}
+
+	pi.registerShortcut(COMMIT_REMINDER_TOGGLE_SHORTCUT, {
+		description: "Toggle final-review commit reminders for this session",
+		handler: async (ctx) => {
+			commitReminderEnabledForSession = !commitReminderEnabledForSession;
+			await updateCommitReminderStatus(ctx);
+			const state = commitReminderEnabledForSession ? "enabled" : "muted";
+			ctx.ui.notify(`Commit reminders ${state} for this session (${COMMIT_REMINDER_TOGGLE_SHORTCUT}).`, commitReminderEnabledForSession ? "info" : "warning");
+		},
+	});
 
 	pi.registerCommand("final-review", {
 		description: "Run final checks and read-only SDK sub-agent final review. Usage: /final-review enable|auto on|auto off|checks [on|off]|[background|blocking] [both|codex|glm] [rev <rev>] [steer] [force]; /final-review send [latest|#id]|status|cancel|note <text>|config",
@@ -2806,9 +2886,13 @@ export const __test__ = {
 	parseArgs,
 	buildFinalizationSnapshot,
 	classifyToolForFinalization,
+	COMMIT_REMINDER_TOGGLE_SHORTCUT,
+	commitReminderEffectiveEnabled,
 	commitReminderPrompt,
 	commitReminderPromptForStates,
+	commitReminderStatusText,
 	commitReminderVcsState,
+	sendUserMessageAfterCurrentTurn,
 	collectCommitReminderStates,
 	parseChangedPaths,
 	parseCommitReminderConfig,
@@ -2823,7 +2907,7 @@ export const __test__ = {
 	RECENT_COMMIT_AUTO_REVIEW_WINDOW_MS,
 	parseGitStatusPaths,
 	parseGitUntrackedPaths,
-	agentEndWasAborted,
+	agentEndShouldSkipFinalization,
 	applyCommandWrapper,
 	discoverChildProjects,
 	parseFinalCheckChildProjectsConfig,
@@ -2835,6 +2919,7 @@ export const __test__ = {
 	parseTimeoutMs,
 	reviewBundleHash,
 	checkedDiffHashesFromEntries,
+	finalCheckReportCancelled,
 	finalCheckReportNeedsAttention,
 	finalCheckReportPassed,
 	finalCheckReportsFromEntries,
@@ -2855,6 +2940,7 @@ export const __test__ = {
 	resultNeedsFollowUp,
 	reviewerOutputNeedsFollowUp,
 	reviewReportsFromEntries,
+	shouldSendFinalCheckFollowUp,
 	shouldSendFollowUp,
 	shouldAutoReviewSteer,
 	summarizeFinalCheckReport,
