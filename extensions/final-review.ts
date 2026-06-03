@@ -1651,17 +1651,42 @@ function formatFinalCheckReport(report: FinalCheckReport, options: { includePass
 	return lines.join("\n").trimEnd();
 }
 
+function formatFinalCheckAttentionReport(report: FinalCheckReport): string {
+	const attentionResults = report.results.filter(finalCheckResultNeedsAttention);
+	const lines: string[] = [];
+	lines.push(`# Final checks #${report.id} failed`);
+	lines.push(`Target: ${report.target}`);
+	lines.push(`Diff hash: ${report.diffHash}`);
+	lines.push(`Duration: ${formatDuration(report.finishedAt - report.startedAt)}`);
+	lines.push(`Failed commands: ${attentionResults.length}/${report.commands.length}`);
+	lines.push("");
+	if (attentionResults.length === 0) {
+		lines.push("No failed command output was captured.");
+		return lines.join("\n").trimEnd();
+	}
+	for (const result of attentionResults) {
+		lines.push(`## ${finalCheckDisplayIcon(result)} ${result.name} — ${finalCheckDisplayLabel(result)} (${formatDuration(result.durationMs)})`);
+		lines.push(`Command: ${result.command}`);
+		lines.push(`Working directory: ${result.cwd ?? "."}`);
+		if (result.exitCode !== undefined) lines.push(`Exit code: ${result.exitCode}`);
+		if (result.error) lines.push(`Error: ${result.error}`);
+		lines.push("");
+		lines.push(result.output || "(no output)");
+		lines.push("");
+	}
+	return lines.join("\n").trimEnd();
+}
+
 function summarizeFinalCheckReport(report: FinalCheckReport): string {
-	const failed = report.results.filter(finalCheckResultNeedsAttention).length;
-	const skipped = report.results.filter((result) => result.outcome === "skipped").length;
-	const notRun = Math.max(0, report.commands.length - report.results.length);
 	if (finalCheckReportPassed(report)) return `Final checks #${report.id}: ✓ ${report.results.length}/${report.commands.length} passed`;
-	const bits = report.results.map((result) => `${finalCheckDisplayIcon(result)} ${result.name} ${finalCheckDisplayLabel(result)} ${formatDuration(result.durationMs)}`);
-	return `Final checks #${report.id}: ${failed} failed${skipped ? `, ${skipped} skipped` : ""}${notRun ? `, ${notRun} not run` : ""}; ${bits.join("; ")}`;
+	const attentionResults = report.results.filter(finalCheckResultNeedsAttention);
+	if (attentionResults.length === 0) return `Final checks #${report.id}: did not pass`;
+	const bits = attentionResults.map((result) => `${finalCheckDisplayIcon(result)} ${result.name} ${finalCheckDisplayLabel(result)} ${formatDuration(result.durationMs)}`);
+	return `Final checks #${report.id}: ${attentionResults.length} failed; ${bits.join("; ")}`;
 }
 
 function finalChecksFollowUpMessage(report: FinalCheckReport): string {
-	return `Final checks #${report.id} did not pass. The final-review extension ran the configured project commands after your turn. Continue fixing the project until these checks pass; do not claim the work is done yet. If automatic review is enabled, it is deferred until the checks pass.\n\n${formatFinalCheckReport(report)}`;
+	return `Final checks #${report.id} failed. Continue fixing the project until checks pass; do not claim the work is done yet. Automatic review is deferred.\n\n${formatFinalCheckAttentionReport(report)}`;
 }
 
 function summarizeReport(report: ReviewReport): string {

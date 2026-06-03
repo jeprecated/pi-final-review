@@ -123,7 +123,7 @@ Running final reviews/checks can be cancelled with Escape in interactive mode or
 
 Commit reminders can be muted or re-enabled for the current Pi session with `Alt+M`. The footer shows the current session state as `commit:on`, `commit:off`, `commit:cfg-off`, or `commit:disabled`.
 
-`finalChecks` runs project commands after agent turns. If a command fails, times out, or is cancelled, the extension sends the command, exit status, and captured output back to the agent as a follow-up and defers automatic review until checks pass. Successful check output is kept in the UI report but is not sent to the agent.
+`finalChecks` runs project commands after agent turns. If a command fails, times out, or is cancelled, the extension sends only the commands needing attention (with exit status and captured output) back to the agent as a follow-up and defers automatic review until checks pass. Successful, skipped, and not-run commands stay in the UI report but are omitted from the agent follow-up.
 
 Command entries can be strings or objects with:
 

@@ -504,6 +504,39 @@ test("cancelled final checks do not send follow-ups", () => {
 	assert.equal(finalReview.shouldSendFinalCheckFollowUp(failed, config.finalChecks, { suppressFollowUp: true }), false);
 });
 
+test("final check follow-ups only include commands that need attention", () => {
+	const report: Parameters<typeof finalReview.formatFinalCheckReport>[0] = {
+		id: 1,
+		startedAt: 0,
+		finishedAt: 14_000,
+		target: "working copy changes (@ vs @-)",
+		diffHash: "b6eb5edfc3ccd9b2",
+		commands: [
+			{ name: "install project dependencies", command: "sd all install" },
+			{ name: "agent-tick i18n audit", command: "sd agent-tick i18n-audit" },
+			{ name: "agent-tick full check", command: "sd agent-tick full-check" },
+		],
+		results: [
+			{ name: "install project dependencies", command: "sd all install", outcome: "success", durationMs: 13_400, output: "" },
+			{ name: "agent-tick i18n audit", command: "sd agent-tick i18n-audit", outcome: "failed", durationMs: 510, output: "Found 1 visible strings missing from Lingui extraction", exitCode: 1 },
+			{ name: "agent-tick full check", command: "sd agent-tick full-check", outcome: "skipped", durationMs: 0, output: "Skipped because a previous final check failed and continueOnFailure=false." },
+		],
+	};
+
+	const followUp = finalReview.finalChecksFollowUpMessage(report);
+	assert.match(followUp, /agent-tick i18n audit/);
+	assert.match(followUp, /Found 1 visible strings missing/);
+	assert.doesNotMatch(followUp, /install project dependencies/);
+	assert.doesNotMatch(followUp, /agent-tick full check/);
+	assert.doesNotMatch(followUp, /continueOnFailure=false/);
+
+	const summary = finalReview.summarizeFinalCheckReport(report);
+	assert.match(summary, /1 failed/);
+	assert.match(summary, /agent-tick i18n audit/);
+	assert.doesNotMatch(summary, /install project dependencies/);
+	assert.doesNotMatch(summary, /agent-tick full check/);
+});
+
 test("follow-up detection handles structured verdicts and qualified clean phrases", () => {
 	assert.equal(finalReview.parseReviewerVerdict("Verdict: clean\nNo issues."), "clean");
 	assert.equal(finalReview.reviewerOutputNeedsFollowUp("Verdict: clean\nNo issues."), false);
